@@ -2012,7 +2012,14 @@ pub mod mem_pool {
         props.allocType = sys::CUmemAllocationType::CU_MEM_ALLOCATION_TYPE_PINNED;
         props.handleTypes = sys::CUmemAllocationHandleType::CU_MEM_HANDLE_TYPE_NONE;
         props.location.type_ = sys::CUmemLocationType::CU_MEM_LOCATION_TYPE_DEVICE;
-        props.location.id = ordinal;
+        #[cfg(feature = "cuda-13020")]
+        {
+            props.location.__bindgen_anon_1.id = ordinal;
+        }
+        #[cfg(not(feature = "cuda-13020"))]
+        {
+            props.location.id = ordinal;
+        }
 
         sys::cuMemPoolCreate(pool.as_mut_ptr(), &props).result()?;
         Ok(pool.assume_init())
