@@ -79,12 +79,10 @@ impl Cudnn {
 impl<T> Drop for FilterDescriptor<T> {
     fn drop(&mut self) {
         let desc = std::mem::replace(&mut self.desc, std::ptr::null_mut());
-        if !desc.is_null() {
-            if let Err(e) = unsafe { result::destroy_filter_descriptor(desc) } {
-                // Log but don't panic - Drop should not panic
-                #[cfg(feature = "std")]
-                eprintln!("cudarc: failed to destroy filter descriptor: {:?}", e);
-            }
+        if !desc.is_null() && unsafe { result::destroy_filter_descriptor(desc) }.is_err() {
+            // Log but don't panic - Drop should not panic
+            #[cfg(feature = "std")]
+            eprintln!("cudarc: failed to destroy filter descriptor");
         }
     }
 }
@@ -187,12 +185,10 @@ impl<T> ConvDescriptor<T> {
 impl<T> Drop for ConvDescriptor<T> {
     fn drop(&mut self) {
         let desc = std::mem::replace(&mut self.desc, std::ptr::null_mut());
-        if !desc.is_null() {
-            if let Err(e) = unsafe { result::destroy_convolution_descriptor(desc) } {
-                // Log but don't panic - Drop should not panic
-                #[cfg(feature = "std")]
-                eprintln!("cudarc: failed to destroy convolution descriptor: {:?}", e);
-            }
+        if !desc.is_null() && unsafe { result::destroy_convolution_descriptor(desc) }.is_err() {
+            // Log but don't panic - Drop should not panic
+            #[cfg(feature = "std")]
+            eprintln!("cudarc: failed to destroy convolution descriptor");
         }
     }
 }

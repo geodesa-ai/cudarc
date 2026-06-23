@@ -105,7 +105,11 @@ impl CudaContext {
             device = ordinal,
             async_alloc = has_async_alloc,
             "CUDA device init: async alloc (cudaMallocAsync / memory pools) {}",
-            if has_async_alloc { "ENABLED (SM8+)" } else { "DISABLED (pre-SM8 or pools unsupported)" }
+            if has_async_alloc {
+                "ENABLED (SM8+)"
+            } else {
+                "DISABLED (pre-SM8 or pools unsupported)"
+            }
         );
         Ok(ctx)
     }
@@ -869,9 +873,6 @@ impl CudaStream {
     ///
     /// See [cuda docs](https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__STREAM.html#group__CUDA__STREAM_1g6a898b652dfc6aa1d5c8d97062618b2f)
     pub fn wait(&self, event: &CudaEvent) -> Result<(), DriverError> {
-        if self.ctx != event.ctx {
-            return Err(DriverError(sys::cudaError_enum::CUDA_ERROR_INVALID_CONTEXT));
-        }
         self.ctx.bind_to_thread()?;
         unsafe {
             result::stream::wait_event(
@@ -1340,8 +1341,34 @@ impl<T> DevicePtr<T> for CudaView<'_, T> {
     }
 }
 
+impl<'a, T> CudaView<'a, T> {
+    /// Identical behavior to [DevicePtr::device_ptr()], but the lifetime on the returned
+    /// [SyncOnDrop], matches the lifetime of the view.
+    pub fn view_ptr(self, stream: &'a CudaStream) -> (sys::CUdeviceptr, SyncOnDrop<'a>) {
+        if self.stream.context().is_managing_stream_synchronization() {
+            if let Some(write) = self.write.as_ref() {
+                stream.ctx.record_err(stream.wait(write));
+            }
+        }
+        (self.ptr, SyncOnDrop::record_event(self.read, stream))
+    }
+}
+
 impl<T> DevicePtr<T> for CudaViewMut<'_, T> {
     fn device_ptr<'a>(&'a self, stream: &'a CudaStream) -> (sys::CUdeviceptr, SyncOnDrop<'a>) {
+        if self.stream.context().is_managing_stream_synchronization() {
+            if let Some(write) = self.write.as_ref() {
+                stream.ctx.record_err(stream.wait(write));
+            }
+        }
+        (self.ptr, SyncOnDrop::record_event(self.read, stream))
+    }
+}
+
+impl<'a, T> CudaViewMut<'a, T> {
+    /// Identical behavior to [DevicePtr::device_ptr()], but the lifetime on the returned
+    /// [SyncOnDrop], matches the lifetime of the view.
+    pub fn view_ptr(self, stream: &'a CudaStream) -> (sys::CUdeviceptr, SyncOnDrop<'a>) {
         if self.stream.context().is_managing_stream_synchronization() {
             if let Some(write) = self.write.as_ref() {
                 stream.ctx.record_err(stream.wait(write));
@@ -1398,6 +1425,22 @@ impl<T> DevicePtrMut<T> for CudaViewMut<'_, T> {
         &'a mut self,
         stream: &'a CudaStream,
     ) -> (sys::CUdeviceptr, SyncOnDrop<'a>) {
+        if self.stream.context().is_managing_stream_synchronization() {
+            if let Some(read) = self.read.as_ref() {
+                stream.ctx.record_err(stream.wait(read));
+            }
+            if let Some(write) = self.write.as_ref() {
+                stream.ctx.record_err(stream.wait(write));
+            }
+        }
+        (self.ptr, SyncOnDrop::record_event(self.write, stream))
+    }
+}
+
+impl<'a, T> CudaViewMut<'a, T> {
+    /// Identical behavior to [DevicePtrMut::device_ptr_mut()], but the lifetime on the returned
+    /// [SyncOnDrop], matches the lifetime of the view.
+    pub fn view_ptr_mut(self, stream: &'a CudaStream) -> (sys::CUdeviceptr, SyncOnDrop<'a>) {
         if self.stream.context().is_managing_stream_synchronization() {
             if let Some(read) = self.read.as_ref() {
                 stream.ctx.record_err(stream.wait(read));
@@ -1832,18 +1875,30 @@ impl CudaStream {
         let src_ctx = src.stream().context();
         let dst_ctx = self.context();
 
-        let (src, _record_src) = src.device_ptr(self);
-        let (dst, _record_dst) = dst.device_ptr_mut(self);
-
         if src_ctx == dst_ctx {
-            unsafe { result::memcpy_dtod_async(dst, src, num_bytes, self.cu_stream) }
+            let (src_ptr, _record_src) = src.device_ptr(self);
+            let (dst_ptr, _record_dst) = dst.device_ptr_mut(self);
+            unsafe { result::memcpy_dtod_async(dst_ptr, src_ptr, num_bytes, self.cu_stream) }
         } else {
+            // NOTE: Although we want the current stream to wait on src to be ready,
+            // we can't use src.device_ptr(self). When `_record_src` is dropped,
+            // we record an event from the src_stream onto dst_stream (i.e., self). This is not
+            // allowed in CUDA, and will return a CUDA_ERROR_INVALID_HANDLE
+            // https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__CTX.html#group__CUDA__CTX_1gf3ee63561a7a371fa9d4dc0e31f94afd
+            let (src_ptr, _record_src) = src.device_ptr(src.stream());
+            let (dst_ptr, _record_dst) = dst.device_ptr_mut(self);
+            // NOTE: Although we can't record events on streams they weren't created on,
+            // we can *wait* on events from any stream. We can leverage this and wait on
+            // a src event.
+            // OPTIM: Ideally we could wait on the src write_events, but we can artificially
+            // insert an event which guarantees src is available.
+            self.wait(&src.stream().record_event(None)?)?;
             unsafe {
                 result::memcpy_peer_async(
                     dst_ctx.cu_ctx,
-                    dst,
+                    dst_ptr,
                     src_ctx.cu_ctx,
-                    src,
+                    src_ptr,
                     num_bytes,
                     self.cu_stream,
                 )
@@ -2105,6 +2160,15 @@ impl<'a, T> CudaView<'a, T> {
     pub fn try_split_at(&self, mid: usize) -> Option<(Self, Self)> {
         (mid <= self.len()).then(|| (self.resize(0, mid), self.resize(mid, self.len)))
     }
+
+    /// Returns an iterarow over subviews of size `chunk_size`. Differs from [std::slice::ChunksExact],
+    /// in that it asserts that the chunk_size must divide evenly into the length, instead of returning
+    /// a remainder.
+    pub fn chunks_exact(&self, chunk_size: usize) -> impl Iterator<Item = CudaView<'a, T>> + '_ {
+        assert!(self.len.is_multiple_of(chunk_size));
+        let num_chunks = self.len / chunk_size;
+        (0..num_chunks).map(move |i| self.resize(i * chunk_size, (i + 1) * chunk_size))
+    }
 }
 
 impl<'a, T> CudaViewMut<'a, T> {
@@ -2235,6 +2299,22 @@ impl<'a, T> CudaViewMut<'a, T> {
                 marker: PhantomData,
             };
             (a, b)
+        })
+    }
+
+    /// Returns an iterarow over subviews of size `chunk_size`. Differs from [std::slice::ChunksExactMut],
+    /// in that it asserts that the chunk_size must divide evenly into the length, instead of returning
+    /// a remainder.
+    pub fn chunks_exact_mut(self, chunk_size: usize) -> impl Iterator<Item = CudaViewMut<'a, T>> {
+        assert!(self.len.is_multiple_of(chunk_size));
+        let num_chunks = self.len / chunk_size;
+        (0..num_chunks).map(move |i| CudaViewMut {
+            ptr: self.ptr + (i * chunk_size * std::mem::size_of::<T>()) as u64,
+            len: chunk_size,
+            read: self.read,
+            write: self.write,
+            stream: self.stream,
+            marker: PhantomData,
         })
     }
 

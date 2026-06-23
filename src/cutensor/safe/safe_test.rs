@@ -1,6 +1,8 @@
 #[cfg(test)]
 mod tests {
-    use crate::cutensor::safe::{CuTensor, TensorDescriptor};
+    use std::{println, vec};
+
+    use crate::cutensor::safe::CuTensor;
     use crate::cutensor::sys::cudaDataType_t;
     use crate::driver::CudaContext;
 

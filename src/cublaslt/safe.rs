@@ -3,7 +3,6 @@
 use super::{result, result::CublasError, sys};
 use crate::cublaslt::result::set_matrix_layout_attribute;
 use crate::driver::sys::{CUdevice_attribute, CUdeviceptr};
-use crate::driver::{CudaSlice, CudaStream, DevicePtr, DevicePtrMut, DriverError, TryClone};
 #[cfg(any(
     feature = "cuda-12080",
     feature = "cuda-12090",
@@ -11,6 +10,7 @@ use crate::driver::{CudaSlice, CudaStream, DevicePtr, DevicePtrMut, DriverError,
     feature = "cuda-13010",
 ))]
 use crate::driver::DeviceRepr;
+use crate::driver::{CudaSlice, CudaStream, DevicePtr, DevicePtrMut, DriverError, TryClone};
 use core::ffi::c_int;
 use core::marker::PhantomData;
 use core::mem;
@@ -1004,8 +1004,8 @@ pub trait ScaledMatmul: MatmulShared {
         let d_layout = MatrixLayout::new(Self::output_type(), cfg.m, cfg.n, cfg.ldd)?;
 
         // 6. Heuristic search
-        let matmul_pref = MatmulPref::new()?;
-        matmul_pref.set_workspace_size(workspace.size)?;
+        let matmul_pref = MatmulPreference::new()?;
+        matmul_pref.set_max_workspace_bytes(workspace.size as u64)?;
 
         let heuristic = result::get_matmul_algo_heuristic(
             *self.handle(),

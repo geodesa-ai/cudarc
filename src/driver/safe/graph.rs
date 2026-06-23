@@ -1,5 +1,6 @@
 use std::marker::PhantomData;
 use std::sync::Arc;
+use std::vec::Vec;
 
 use crate::driver::{result, sys};
 
@@ -550,13 +551,9 @@ impl CudaGraphDef {
 
     /// Instantiate the graph with raw flags (u64). Use this when the flags value
     /// is 0 (no flags), since the `CUgraphInstantiate_flags` enum has no 0 variant.
-    pub fn instantiate_raw(
-        &self,
-        flags: u64,
-    ) -> Result<CudaGraphExec<'_>, DriverError> {
+    pub fn instantiate_raw(&self, flags: u64) -> Result<CudaGraphExec<'_>, DriverError> {
         self.ctx.bind_to_thread()?;
-        let cu_graph_exec =
-            unsafe { result::graph::instantiate_raw(self.cu_graph, flags) }?;
+        let cu_graph_exec = unsafe { result::graph::instantiate_raw(self.cu_graph, flags) }?;
         Ok(CudaGraphExec {
             cu_graph_exec,
             ctx: self.ctx.clone(),
@@ -679,12 +676,8 @@ impl CudaGraphDef {
             extra: std::ptr::null_mut(),
         };
 
-        let cu_node = result::graph::add_kernel_node(
-            self.cu_graph,
-            dep_ptr,
-            dep_ptrs.len(),
-            &kernel_params,
-        )?;
+        let cu_node =
+            result::graph::add_kernel_node(self.cu_graph, dep_ptr, dep_ptrs.len(), &kernel_params)?;
 
         Ok(CudaGraphNode {
             cu_node,
@@ -732,12 +725,8 @@ impl CudaGraphDef {
             ctx: self.ctx.cu_ctx(),
         };
 
-        let cu_node = result::graph::add_kernel_node(
-            self.cu_graph,
-            dep_ptr,
-            dep_ptrs.len(),
-            &kernel_params,
-        )?;
+        let cu_node =
+            result::graph::add_kernel_node(self.cu_graph, dep_ptr, dep_ptrs.len(), &kernel_params)?;
 
         Ok(CudaGraphNode {
             cu_node,
