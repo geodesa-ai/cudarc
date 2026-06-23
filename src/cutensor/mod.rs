@@ -34,6 +34,7 @@
 
 pub mod result;
 #[allow(warnings)]
+#[rustfmt::skip]
 pub mod sys;
 
 pub mod safe;

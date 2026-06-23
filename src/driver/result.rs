@@ -171,10 +171,16 @@ pub mod device {
             #[cfg(not(any(
                 feature = "cuda-13000",
                 feature = "cuda-13010",
-                feature = "cuda-13020"
+                feature = "cuda-13020",
+                feature = "cuda-13030"
             )))]
             sys::cuDeviceGetUuid(uuid.as_mut_ptr(), dev).result()?;
-            #[cfg(any(feature = "cuda-13000", feature = "cuda-13010", feature = "cuda-13020"))]
+            #[cfg(any(
+                feature = "cuda-13000",
+                feature = "cuda-13010",
+                feature = "cuda-13020",
+                feature = "cuda-13030"
+            ))]
             sys::cuDeviceGetUuid_v2(uuid.as_mut_ptr(), dev).result()?;
             id = uuid.assume_init();
         }
@@ -1290,10 +1296,16 @@ pub mod event {
             #[cfg(not(any(
                 feature = "cuda-13000",
                 feature = "cuda-13010",
-                feature = "cuda-13020"
+                feature = "cuda-13020",
+                feature = "cuda-13030"
             )))]
             sys::cuEventElapsedTime((&mut ms) as *mut _, start, end).result()?;
-            #[cfg(any(feature = "cuda-13000", feature = "cuda-13010", feature = "cuda-13020"))]
+            #[cfg(any(
+                feature = "cuda-13000",
+                feature = "cuda-13010",
+                feature = "cuda-13020",
+                feature = "cuda-13030"
+            ))]
             sys::cuEventElapsedTime_v2((&mut ms) as *mut _, start, end).result()?;
         }
         Ok(ms)
@@ -1518,6 +1530,8 @@ pub mod external_memory {
 }
 
 pub mod graph {
+    use std::{vec, vec::Vec};
+
     use super::*;
 
     /// See [cuda docs](https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__GRAPH.html#group__CUDA__GRAPH_1gb53b435e178cccfa37ac87285d2c3fa1)
@@ -1540,8 +1554,7 @@ pub mod graph {
         flags: u64,
     ) -> Result<sys::CUgraphExec, DriverError> {
         let mut graph_exec = MaybeUninit::uninit();
-        sys::cuGraphInstantiateWithFlags(graph_exec.as_mut_ptr(), graph, flags)
-            .result()?;
+        sys::cuGraphInstantiateWithFlags(graph_exec.as_mut_ptr(), graph, flags).result()?;
         Ok(graph_exec.assume_init())
     }
 
@@ -2012,11 +2025,11 @@ pub mod mem_pool {
         props.allocType = sys::CUmemAllocationType::CU_MEM_ALLOCATION_TYPE_PINNED;
         props.handleTypes = sys::CUmemAllocationHandleType::CU_MEM_HANDLE_TYPE_NONE;
         props.location.type_ = sys::CUmemLocationType::CU_MEM_LOCATION_TYPE_DEVICE;
-        #[cfg(feature = "cuda-13020")]
+        #[cfg(any(feature = "cuda-13020", feature = "cuda-13030"))]
         {
             props.location.__bindgen_anon_1.id = ordinal;
         }
-        #[cfg(not(feature = "cuda-13020"))]
+        #[cfg(not(any(feature = "cuda-13020", feature = "cuda-13030")))]
         {
             props.location.id = ordinal;
         }
@@ -2136,15 +2149,11 @@ pub mod mem_pool {
 mod tests {
     use super::super::safe::{CudaContext, CudaSlice};
     use super::*;
-    use std::println;
 
     #[test]
+    #[ignore = "must be executed with multiple gpus"]
     fn peer_transfer_contexts() -> Result<(), DriverError> {
         let ctx1 = CudaContext::new(0)?;
-        if device::get_count()? < 2 {
-            println!("Skip test because not enough cuda devices");
-            return Ok(());
-        }
         let stream1 = ctx1.default_stream();
         let a: CudaSlice<f64> = stream1.alloc_zeros::<f64>(10)?;
 
@@ -2171,12 +2180,9 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "must be executed with multiple gpus"]
     fn re_associate_context_for_memory_op() -> Result<(), DriverError> {
         let ctx1 = CudaContext::new(0)?;
-        if device::get_count()? < 2 {
-            println!("Skip test because not enough cuda devices");
-            return Ok(());
-        }
         let stream1 = ctx1.default_stream();
         let a: CudaSlice<f64> = stream1.alloc_zeros::<f64>(10)?;
 

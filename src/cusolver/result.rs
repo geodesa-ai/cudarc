@@ -391,10 +391,11 @@ pub unsafe fn dn_ssyevd(
 mod tests {
     use super::sys::cublasFillMode_t::CUBLAS_FILL_MODE_LOWER;
     use crate::cusolver::result::{
-        dn_create, dn_destroy, dn_sgeqrf, dn_sgesvd, dn_sgetrf, dn_spotrf, dn_spotrf_buffer_size,
+        dn_create, dn_destroy, dn_sgeqrf, dn_sgetrf, dn_spotrf, dn_spotrf_buffer_size,
     };
     use crate::driver::safe::core::DevicePtr;
     use crate::driver::{CudaContext, CudaSlice, CudaStream};
+    use std::{vec, vec::Vec};
 
     fn get_ptr<T>(slice: &CudaSlice<T>, stream: &CudaStream) -> *mut T {
         slice.device_ptr(stream).0 as *mut T
@@ -411,8 +412,7 @@ mod tests {
         let lda = n;
 
         let mut lwork: i32 = 0;
-        let mut work = stream.alloc_zeros::<f32>(1).unwrap();
-        let mut info = stream.alloc_zeros::<i32>(1).unwrap();
+        let info = stream.alloc_zeros::<i32>(1).unwrap();
 
         let handle = dn_create().unwrap();
         unsafe {
@@ -426,7 +426,7 @@ mod tests {
             )
             .unwrap();
         }
-        work = unsafe { stream.alloc(lwork as usize).unwrap() };
+        let work = unsafe { stream.alloc(lwork as usize).unwrap() };
 
         unsafe {
             dn_spotrf(
@@ -463,9 +463,9 @@ mod tests {
         let mut a_dev = stream.clone_htod(&a).unwrap();
         let lda = n;
 
-        let mut ipiv = stream.alloc_zeros::<i32>(n as usize).unwrap();
-        let mut work = stream.alloc_zeros::<f32>(n as usize * n as usize).unwrap();
-        let mut info = stream.alloc_zeros::<i32>(1).unwrap();
+        let ipiv = stream.alloc_zeros::<i32>(n as usize).unwrap();
+        let work = stream.alloc_zeros::<f32>(n as usize * n as usize).unwrap();
+        let info = stream.alloc_zeros::<i32>(1).unwrap();
 
         let handle = dn_create().unwrap();
 
@@ -483,7 +483,7 @@ mod tests {
             .unwrap();
         }
 
-        let a_result = stream.clone_dtoh(&a_dev).unwrap();
+        let _a_result = stream.clone_dtoh(&a_dev).unwrap();
         let info_result = stream.clone_dtoh(&info).unwrap();
 
         assert_eq!(info_result[0], 0);
@@ -504,9 +504,9 @@ mod tests {
         let mut a_dev = stream.clone_htod(&a).unwrap();
         let lda = m;
 
-        let mut tau = stream.alloc_zeros::<f32>(m.min(n) as usize).unwrap();
-        let mut work = stream.alloc_zeros::<f32>((m * n) as usize).unwrap();
-        let mut info = stream.alloc_zeros::<i32>(1).unwrap();
+        let tau = stream.alloc_zeros::<f32>(m.min(n) as usize).unwrap();
+        let work = stream.alloc_zeros::<f32>((m * n) as usize).unwrap();
+        let info = stream.alloc_zeros::<i32>(1).unwrap();
 
         let handle = dn_create().unwrap();
 

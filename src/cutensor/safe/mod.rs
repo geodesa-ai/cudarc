@@ -43,7 +43,7 @@ pub use contraction::*;
 pub use reduction::*;
 pub use tensor::*;
 
-use std::sync::Arc;
+use std::{sync::Arc, vec};
 
 use crate::driver::CudaStream;
 
