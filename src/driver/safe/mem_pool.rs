@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 use crate::driver::{result, sys};
 
+use super::core::AllocationKind;
 use super::{CudaContext, CudaSlice, CudaStream, DeviceRepr, DriverError, ValidAsZeroBits};
 use std::marker::PhantomData;
 
@@ -335,6 +336,7 @@ impl CudaStream {
             read,
             write,
             stream: self.clone(),
+            allocation: AllocationKind::Async,
             marker: PhantomData,
         })
     }
