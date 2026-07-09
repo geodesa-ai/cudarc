@@ -610,7 +610,9 @@ impl CudaContext {
     ///
     /// Must only be called to undo a prior [`disable_async_alloc`](Self::disable_async_alloc).
     pub unsafe fn enable_async_alloc(&self) {
-        self.has_async_alloc.store(true, Ordering::Relaxed);
+        if let Ok(supported) = Self::supports_async_alloc(self.cu_device) {
+            self.has_async_alloc.store(supported, Ordering::Relaxed);
+        }
     }
 
     /// Check whether async alloc (`cudaMallocAsync`) is currently enabled.
@@ -942,6 +944,7 @@ pub struct CudaSlice<T> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AllocationKind {
+    Empty,
     Async,
     Sync,
     CaptureRetained,
@@ -962,6 +965,7 @@ impl<T> Drop for CudaSlice<T> {
             }
         }
         match self.allocation {
+            AllocationKind::Empty => {}
             AllocationKind::Async => {
                 ctx.record_err(unsafe {
                     result::free_async(self.cu_device_ptr, self.stream.cu_stream)
@@ -973,9 +977,7 @@ impl<T> Drop for CudaSlice<T> {
             }
             AllocationKind::CaptureRetained => {
                 if !ctx.capture_retain.load(Ordering::Relaxed) {
-                    ctx.record_err::<()>(Err(DriverError(
-                        sys::CUresult::CUDA_ERROR_ILLEGAL_STATE,
-                    )));
+                    ctx.record_err::<()>(Err(DriverError(sys::CUresult::CUDA_ERROR_ILLEGAL_STATE)));
                 }
             }
         }
@@ -1710,6 +1712,53 @@ impl CudaStream {
     /// Allocates an empty [CudaSlice] with 0 length.
     pub fn null<T>(self: &Arc<Self>) -> Result<CudaSlice<T>, result::DriverError> {
         self.ctx.bind_to_thread()?;
+        let (read, write) = if self.ctx.is_event_tracking() {
+            (
+                Some(self.ctx.new_event(None)?),
+                Some(self.ctx.new_event(None)?),
+            )
+        } else {
+            (None, None)
+        };
+        Ok(CudaSlice {
+            cu_device_ptr: 0,
+            len: 0,
+            read,
+            write,
+            stream: self.clone(),
+            allocation: AllocationKind::Empty,
+            marker: PhantomData,
+        })
+    }
+
+    fn slice_from_allocation<T>(
+        self: &Arc<Self>,
+        cu_device_ptr: sys::CUdeviceptr,
+        len: usize,
+        allocation: AllocationKind,
+    ) -> Result<CudaSlice<T>, result::DriverError> {
+        let (read, write) = if self.ctx.is_event_tracking() {
+            (
+                Some(self.ctx.new_event(None)?),
+                Some(self.ctx.new_event(None)?),
+            )
+        } else {
+            (None, None)
+        };
+        Ok(CudaSlice {
+            cu_device_ptr,
+            len,
+            read,
+            write,
+            stream: self.clone(),
+            allocation,
+            marker: PhantomData,
+        })
+    }
+
+    #[allow(dead_code)]
+    fn null_allocated<T>(self: &Arc<Self>) -> Result<CudaSlice<T>, result::DriverError> {
+        self.ctx.bind_to_thread()?;
         let async_alloc = self.ctx.has_async_alloc.load(Ordering::Relaxed);
         let capture_retain = self.ctx.capture_retain.load(Ordering::Relaxed) && !async_alloc;
         let (cu_device_ptr, allocation) = if capture_retain {
@@ -1725,15 +1774,7 @@ impl CudaStream {
         } else {
             (unsafe { result::malloc_sync(0) }?, AllocationKind::Sync)
         };
-        Ok(CudaSlice {
-            cu_device_ptr,
-            len: 0,
-            read: None,
-            write: None,
-            stream: self.clone(),
-            allocation,
-            marker: PhantomData,
-        })
+        self.slice_from_allocation(cu_device_ptr, 0, allocation)
     }
 
     /// Allocates a [CudaSlice] with `len` elements of type `T`.
@@ -1744,6 +1785,9 @@ impl CudaStream {
         len: usize,
     ) -> Result<CudaSlice<T>, DriverError> {
         self.ctx.bind_to_thread()?;
+        if len == 0 {
+            return self.null();
+        }
         let async_alloc = self.ctx.has_async_alloc.load(Ordering::Relaxed);
         let bytes = len * std::mem::size_of::<T>();
         let capture_retain = self.ctx.capture_retain.load(Ordering::Relaxed) && !async_alloc;
@@ -1760,23 +1804,7 @@ impl CudaStream {
         } else {
             (result::malloc_sync(bytes)?, AllocationKind::Sync)
         };
-        let (read, write) = if self.ctx.is_event_tracking() {
-            (
-                Some(self.ctx.new_event(None)?),
-                Some(self.ctx.new_event(None)?),
-            )
-        } else {
-            (None, None)
-        };
-        Ok(CudaSlice {
-            cu_device_ptr,
-            len,
-            read,
-            write,
-            stream: self.clone(),
-            allocation,
-            marker: PhantomData,
-        })
+        self.slice_from_allocation(cu_device_ptr, len, allocation)
     }
 
     /// Allocate with synchronous `cuMemAlloc`, bypassing the async memory pool.
@@ -1791,6 +1819,9 @@ impl CudaStream {
         len: usize,
     ) -> Result<CudaSlice<T>, DriverError> {
         self.ctx.bind_to_thread()?;
+        if len == 0 {
+            return self.null();
+        }
         let bytes = len * std::mem::size_of::<T>();
         let (cu_device_ptr, allocation) = if self.ctx.capture_retain.load(Ordering::Relaxed) {
             (
@@ -1800,23 +1831,7 @@ impl CudaStream {
         } else {
             (result::malloc_sync(bytes)?, AllocationKind::Sync)
         };
-        let (read, write) = if self.ctx.is_event_tracking() {
-            (
-                Some(self.ctx.new_event(None)?),
-                Some(self.ctx.new_event(None)?),
-            )
-        } else {
-            (None, None)
-        };
-        Ok(CudaSlice {
-            cu_device_ptr,
-            len,
-            read,
-            write,
-            stream: self.clone(),
-            allocation,
-            marker: PhantomData,
-        })
+        self.slice_from_allocation(cu_device_ptr, len, allocation)
     }
 
     /// Allocates with sync `cuMemAlloc` and zeros the memory.

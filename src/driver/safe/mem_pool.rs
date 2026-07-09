@@ -317,6 +317,9 @@ impl CudaStream {
         pool: &CudaMemPool,
     ) -> Result<CudaSlice<T>, DriverError> {
         self.ctx.bind_to_thread()?;
+        if len == 0 {
+            return self.null();
+        }
 
         let num_bytes = len * std::mem::size_of::<T>();
         let cu_device_ptr = result::mem_pool::alloc_async(pool.cu_pool, num_bytes, self.cu_stream)?;
