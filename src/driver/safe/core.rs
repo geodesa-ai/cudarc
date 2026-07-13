@@ -13,6 +13,11 @@ use std::{
     vec::Vec,
 };
 
+#[derive(Debug, Default)]
+pub(crate) struct CaptureAllocationPool {
+    all: Vec<(sys::CUdeviceptr, usize)>,
+}
+
 /// Represents a primary cuda context on a certain device. When created with [CudaContext::new()] it will
 /// push a new primary context onto the stack.
 ///
@@ -38,6 +43,13 @@ pub struct CudaContext {
     /// Retained device pointers from `CudaSlice` drops during capture.
     /// Freed when the captured graph is destroyed.
     pub(crate) retained_ptrs: std::sync::Mutex<Vec<sys::CUdeviceptr>>,
+    /// Sync allocations made while graph capture-retain mode is active.
+    ///
+    /// CUDA graph kernel args bake allocation addresses into the graph. Each
+    /// sync allocation made during capture must remain unique and live for the
+    /// graph lifetime; reusing a dropped allocation for later graph metadata
+    /// mutates arguments that earlier graph nodes still read during replay.
+    pub(crate) capture_allocations: std::sync::Mutex<CaptureAllocationPool>,
 }
 
 unsafe impl Send for CudaContext {}
@@ -63,18 +75,29 @@ impl PartialEq for CudaContext {
 impl Eq for CudaContext {}
 
 impl CudaContext {
+    fn supports_async_alloc(cu_device: sys::CUdevice) -> Result<bool, DriverError> {
+        let memory_pools_supported = unsafe {
+            result::device::get_attribute(
+                cu_device,
+                sys::CUdevice_attribute_enum::CU_DEVICE_ATTRIBUTE_MEMORY_POOLS_SUPPORTED,
+            )?
+        };
+        let compute_capability_major = unsafe {
+            result::device::get_attribute(
+                cu_device,
+                sys::CUdevice_attribute_enum::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,
+            )?
+        };
+
+        Ok(memory_pools_supported > 0 && compute_capability_major >= 8)
+    }
+
     /// Creates a new context on the specified device ordinal.
     pub fn new(ordinal: usize) -> Result<Arc<Self>, DriverError> {
         result::init()?;
         let cu_device = result::device::get(ordinal as i32)?;
         let cu_ctx = unsafe { result::primary_ctx::retain(cu_device) }?;
-        let has_async_alloc = unsafe {
-            let memory_pools_supported = result::device::get_attribute(
-                cu_device,
-                sys::CUdevice_attribute_enum::CU_DEVICE_ATTRIBUTE_MEMORY_POOLS_SUPPORTED,
-            )?;
-            memory_pools_supported > 0
-        };
+        let has_async_alloc = Self::supports_async_alloc(cu_device)?;
         let ctx = Arc::new(CudaContext {
             cu_device,
             cu_ctx,
@@ -85,6 +108,7 @@ impl CudaContext {
             error_state: AtomicU32::new(0),
             capture_retain: AtomicBool::new(false),
             retained_ptrs: std::sync::Mutex::new(Vec::new()),
+            capture_allocations: std::sync::Mutex::new(CaptureAllocationPool::default()),
         });
         ctx.bind_to_thread()?;
         tracing::info!(
@@ -329,6 +353,8 @@ impl CudaContext {
     /// Call [`take_retained_ptrs`](Self::take_retained_ptrs) after capture to
     /// get the retained pointers, and free them when the graph is destroyed.
     pub fn enable_capture_retain(&self) {
+        *self.capture_allocations.lock().unwrap() = CaptureAllocationPool::default();
+        self.retained_ptrs.lock().unwrap().clear();
         self.capture_retain.store(true, Ordering::Relaxed);
     }
 
@@ -345,7 +371,20 @@ impl CudaContext {
     /// these pointers and must free them (via `cuMemFree`) when the captured
     /// graph is no longer needed.
     pub fn take_retained_ptrs(&self) -> Vec<sys::CUdeviceptr> {
-        std::mem::take(&mut *self.retained_ptrs.lock().unwrap())
+        let mut pool = self.capture_allocations.lock().unwrap();
+        let mut retained = std::mem::take(&mut pool.all)
+            .into_iter()
+            .map(|(ptr, _bytes)| ptr)
+            .collect::<Vec<_>>();
+        retained.extend(std::mem::take(&mut *self.retained_ptrs.lock().unwrap()));
+        retained
+    }
+
+    pub(crate) fn capture_alloc_sync(&self, bytes: usize) -> Result<sys::CUdeviceptr, DriverError> {
+        let ptr = unsafe { result::malloc_sync(bytes) }?;
+        let mut pool = self.capture_allocations.lock().unwrap();
+        pool.all.push((ptr, bytes));
+        Ok(ptr)
     }
 
     /// Force synchronous allocation mode (`cudaMalloc`).
@@ -371,7 +410,9 @@ impl CudaContext {
     ///
     /// Must only be called to undo a prior [`disable_async_alloc`](Self::disable_async_alloc).
     pub unsafe fn enable_async_alloc(&self) {
-        self.has_async_alloc.store(true, Ordering::Relaxed);
+        if let Ok(supported) = Self::supports_async_alloc(self.cu_device) {
+            self.has_async_alloc.store(supported, Ordering::Relaxed);
+        }
     }
 
     /// Check whether async alloc (`cudaMallocAsync`) is currently enabled.
@@ -673,7 +714,16 @@ pub struct CudaSlice<T> {
     pub(crate) read: Option<CudaEvent>,
     pub(crate) write: Option<CudaEvent>,
     pub(crate) stream: Arc<CudaStream>,
+    pub(crate) allocation: AllocationKind,
     pub(crate) marker: PhantomData<*const T>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AllocationKind {
+    Empty,
+    Async,
+    Sync,
+    CaptureRetained,
 }
 
 unsafe impl<T> Send for CudaSlice<T> {}
@@ -682,27 +732,39 @@ unsafe impl<T> Sync for CudaSlice<T> {}
 impl<T> Drop for CudaSlice<T> {
     fn drop(&mut self) {
         let ctx = &self.stream.ctx;
-        if let Some(read) = self.read.as_ref() {
-            ctx.record_err(self.stream.wait(read));
+        if ctx.is_managing_stream_synchronization() {
+            if let Some(read) = self.read.as_ref() {
+                ctx.record_err(self.stream.wait(read));
+            }
+            if let Some(write) = self.write.as_ref() {
+                ctx.record_err(self.stream.wait(write));
+            }
         }
-        if let Some(write) = self.write.as_ref() {
-            ctx.record_err(self.stream.wait(write));
-        }
-        // During CUDA graph capture with retain mode: push the pointer to the
-        // retain list instead of freeing. The graph's kernel nodes reference
-        // these addresses, so the memory must stay alive until the graph is
-        // destroyed.
-        if ctx.capture_retain.load(Ordering::Relaxed) {
-            ctx.retained_ptrs.lock().unwrap().push(self.cu_device_ptr);
-            return;
-        }
-        if ctx.has_async_alloc.load(Ordering::Relaxed) {
-            ctx.record_err(unsafe {
-                result::free_async(self.cu_device_ptr, self.stream.cu_stream)
-            });
-        } else {
-            ctx.record_err(self.stream.synchronize());
-            ctx.record_err(unsafe { result::free_sync(self.cu_device_ptr) });
+        match self.allocation {
+            AllocationKind::Empty => {}
+            AllocationKind::Async => {
+                ctx.record_err(unsafe {
+                    result::free_async(self.cu_device_ptr, self.stream.cu_stream)
+                });
+            }
+            AllocationKind::Sync => {
+                ctx.record_err(self.stream.synchronize());
+                ctx.record_err(unsafe { result::free_sync(self.cu_device_ptr) });
+            }
+            AllocationKind::CaptureRetained => {
+                // A capture-retained pointer may be referenced by a captured
+                // graph's kernel nodes, so it must never be freed while such
+                // a graph is alive — regardless of whether retain mode is
+                // still on. Slices allocated during capture legitimately
+                // outlive `end_capture` (e.g. the forward output the caller
+                // reads back after the first replay); pushing to the retained
+                // list hands ownership to whoever drains it (the captured
+                // graph frees the list when it drops). The previous code
+                // recorded a synthetic CUDA_ERROR_ILLEGAL_STATE here, which
+                // surfaced on the next unrelated `check_err()` call and broke
+                // graph-mode decode entirely.
+                ctx.retained_ptrs.lock().unwrap().push(self.cu_device_ptr);
+            }
         }
     }
 }
@@ -1393,34 +1455,31 @@ impl CudaStream {
     /// Allocates an empty [CudaSlice] with 0 length.
     pub fn null<T>(self: &Arc<Self>) -> Result<CudaSlice<T>, result::DriverError> {
         self.ctx.bind_to_thread()?;
-        let cu_device_ptr = if self.ctx.has_async_alloc.load(Ordering::Relaxed) {
-            unsafe { result::malloc_async(self.cu_stream, 0) }?
+        let (read, write) = if self.ctx.is_event_tracking() {
+            (
+                Some(self.ctx.new_event(None)?),
+                Some(self.ctx.new_event(None)?),
+            )
         } else {
-            unsafe { result::malloc_sync(0) }?
+            (None, None)
         };
         Ok(CudaSlice {
-            cu_device_ptr,
+            cu_device_ptr: 0,
             len: 0,
-            read: None,
-            write: None,
+            read,
+            write,
             stream: self.clone(),
+            allocation: AllocationKind::Empty,
             marker: PhantomData,
         })
     }
 
-    /// Allocates a [CudaSlice] with `len` elements of type `T`.
-    /// # Safety
-    /// This is unsafe because the memory is unset.
-    pub unsafe fn alloc<T: DeviceRepr>(
+    fn slice_from_allocation<T>(
         self: &Arc<Self>,
+        cu_device_ptr: sys::CUdeviceptr,
         len: usize,
-    ) -> Result<CudaSlice<T>, DriverError> {
-        self.ctx.bind_to_thread()?;
-        let cu_device_ptr = if self.ctx.has_async_alloc.load(Ordering::Relaxed) {
-            result::malloc_async(self.cu_stream, len * std::mem::size_of::<T>())?
-        } else {
-            result::malloc_sync(len * std::mem::size_of::<T>())?
-        };
+        allocation: AllocationKind,
+    ) -> Result<CudaSlice<T>, result::DriverError> {
         let (read, write) = if self.ctx.is_event_tracking() {
             (
                 Some(self.ctx.new_event(None)?),
@@ -1435,8 +1494,39 @@ impl CudaStream {
             read,
             write,
             stream: self.clone(),
+            allocation,
             marker: PhantomData,
         })
+    }
+
+    /// Allocates a [CudaSlice] with `len` elements of type `T`.
+    /// # Safety
+    /// This is unsafe because the memory is unset.
+    pub unsafe fn alloc<T: DeviceRepr>(
+        self: &Arc<Self>,
+        len: usize,
+    ) -> Result<CudaSlice<T>, DriverError> {
+        self.ctx.bind_to_thread()?;
+        if len == 0 {
+            return self.null();
+        }
+        let async_alloc = self.ctx.has_async_alloc.load(Ordering::Relaxed);
+        let bytes = len * std::mem::size_of::<T>();
+        let capture_retain = self.ctx.capture_retain.load(Ordering::Relaxed) && !async_alloc;
+        let (cu_device_ptr, allocation) = if capture_retain {
+            (
+                self.ctx.capture_alloc_sync(bytes)?,
+                AllocationKind::CaptureRetained,
+            )
+        } else if async_alloc {
+            (
+                result::malloc_async(self.cu_stream, bytes)?,
+                AllocationKind::Async,
+            )
+        } else {
+            (result::malloc_sync(bytes)?, AllocationKind::Sync)
+        };
+        self.slice_from_allocation(cu_device_ptr, len, allocation)
     }
 
     /// Allocate with synchronous `cuMemAlloc`, bypassing the async memory pool.
@@ -1451,23 +1541,19 @@ impl CudaStream {
         len: usize,
     ) -> Result<CudaSlice<T>, DriverError> {
         self.ctx.bind_to_thread()?;
-        let cu_device_ptr = result::malloc_sync(len * std::mem::size_of::<T>())?;
-        let (read, write) = if self.ctx.is_event_tracking() {
+        if len == 0 {
+            return self.null();
+        }
+        let bytes = len * std::mem::size_of::<T>();
+        let (cu_device_ptr, allocation) = if self.ctx.capture_retain.load(Ordering::Relaxed) {
             (
-                Some(self.ctx.new_event(None)?),
-                Some(self.ctx.new_event(None)?),
+                self.ctx.capture_alloc_sync(bytes)?,
+                AllocationKind::CaptureRetained,
             )
         } else {
-            (None, None)
+            (result::malloc_sync(bytes)?, AllocationKind::Sync)
         };
-        Ok(CudaSlice {
-            cu_device_ptr,
-            len,
-            read,
-            write,
-            stream: self.clone(),
-            marker: PhantomData,
-        })
+        self.slice_from_allocation(cu_device_ptr, len, allocation)
     }
 
     /// Allocates with sync `cuMemAlloc` and zeros the memory.
@@ -2414,6 +2500,11 @@ impl CudaStream {
             read,
             write,
             stream: self.clone(),
+            allocation: if self.ctx.has_async_alloc.load(Ordering::Relaxed) {
+                AllocationKind::Async
+            } else {
+                AllocationKind::Sync
+            },
             marker: PhantomData,
         }
     }
