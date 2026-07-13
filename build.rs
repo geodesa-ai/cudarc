@@ -156,6 +156,28 @@ fn cuda_version_from_build_system() -> (usize, usize) {
             return (major, minor);
         }
     }
+
+    // Toolkit minor releases within the same major version are ABI-compatible
+    // for the driver API surface this crate binds against. Fall back to the
+    // newest minor version we do recognize for the detected major, so a
+    // toolkit newer than our version table (e.g. 13.2 when we only list up
+    // to 13.1) still builds instead of hard-failing on every check/build.
+    if let Some((detected_major, _)) = version_number
+        .split_once('.')
+        .and_then(|(major, minor)| Some((major.parse::<usize>().ok()?, minor.parse::<usize>().ok()?)))
+    {
+        if let Some(&(fallback, _)) = SUPPORTED_CUDA_VERSIONS
+            .iter()
+            .find(|&&((major, _), _)| major == detected_major)
+        {
+            println!(
+                "cargo:warning=CUDA toolkit `{version_number}` is newer than the versions this crate recognizes; falling back to {}.{} (same major version, ABI-compatible driver API).",
+                fallback.0, fallback.1
+            );
+            return fallback;
+        }
+    }
+
     panic!("Unsupported cuda toolkit version: `{version_number}`. Please raise a github issue.")
 }
 
