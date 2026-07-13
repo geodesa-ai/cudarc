@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 use crate::driver::{result, sys};
 
+use super::core::AllocationKind;
 use super::{CudaContext, CudaSlice, CudaStream, DeviceRepr, DriverError, ValidAsZeroBits};
 use std::marker::PhantomData;
 
@@ -316,6 +317,9 @@ impl CudaStream {
         pool: &CudaMemPool,
     ) -> Result<CudaSlice<T>, DriverError> {
         self.ctx.bind_to_thread()?;
+        if len == 0 {
+            return self.null();
+        }
 
         let num_bytes = len * std::mem::size_of::<T>();
         let cu_device_ptr = result::mem_pool::alloc_async(pool.cu_pool, num_bytes, self.cu_stream)?;
@@ -335,6 +339,7 @@ impl CudaStream {
             read,
             write,
             stream: self.clone(),
+            allocation: AllocationKind::Async,
             marker: PhantomData,
         })
     }
