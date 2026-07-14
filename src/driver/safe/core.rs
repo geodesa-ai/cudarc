@@ -40,9 +40,6 @@ pub struct CudaContext {
     /// When true, `CudaSlice::Drop` retains memory instead of freeing it.
     /// Used during CUDA graph capture to keep addresses stable for replay.
     pub(crate) capture_retain: AtomicBool,
-    /// Retained device pointers from `CudaSlice` drops during capture.
-    /// Freed when the captured graph is destroyed.
-    pub(crate) retained_ptrs: std::sync::Mutex<Vec<sys::CUdeviceptr>>,
     /// Sync allocations made while graph capture-retain mode is active.
     ///
     /// CUDA graph kernel args bake allocation addresses into the graph. Each
@@ -107,7 +104,6 @@ impl CudaContext {
             event_tracking: AtomicBool::new(true),
             error_state: AtomicU32::new(0),
             capture_retain: AtomicBool::new(false),
-            retained_ptrs: std::sync::Mutex::new(Vec::new()),
             capture_allocations: std::sync::Mutex::new(CaptureAllocationPool::default()),
         });
         ctx.bind_to_thread()?;
@@ -354,7 +350,6 @@ impl CudaContext {
     /// get the retained pointers, and free them when the graph is destroyed.
     pub fn enable_capture_retain(&self) {
         *self.capture_allocations.lock().unwrap() = CaptureAllocationPool::default();
-        self.retained_ptrs.lock().unwrap().clear();
         self.capture_retain.store(true, Ordering::Relaxed);
     }
 
@@ -372,12 +367,10 @@ impl CudaContext {
     /// graph is no longer needed.
     pub fn take_retained_ptrs(&self) -> Vec<sys::CUdeviceptr> {
         let mut pool = self.capture_allocations.lock().unwrap();
-        let mut retained = std::mem::take(&mut pool.all)
+        std::mem::take(&mut pool.all)
             .into_iter()
             .map(|(ptr, _bytes)| ptr)
-            .collect::<Vec<_>>();
-        retained.extend(std::mem::take(&mut *self.retained_ptrs.lock().unwrap()));
-        retained
+            .collect()
     }
 
     pub(crate) fn capture_alloc_sync(&self, bytes: usize) -> Result<sys::CUdeviceptr, DriverError> {
@@ -752,18 +745,12 @@ impl<T> Drop for CudaSlice<T> {
                 ctx.record_err(unsafe { result::free_sync(self.cu_device_ptr) });
             }
             AllocationKind::CaptureRetained => {
-                // A capture-retained pointer may be referenced by a captured
-                // graph's kernel nodes, so it must never be freed while such
-                // a graph is alive — regardless of whether retain mode is
-                // still on. Slices allocated during capture legitimately
-                // outlive `end_capture` (e.g. the forward output the caller
-                // reads back after the first replay); pushing to the retained
-                // list hands ownership to whoever drains it (the captured
-                // graph frees the list when it drops). The previous code
-                // recorded a synthetic CUDA_ERROR_ILLEGAL_STATE here, which
-                // surfaced on the next unrelated `check_err()` call and broke
-                // graph-mode decode entirely.
-                ctx.retained_ptrs.lock().unwrap().push(self.cu_device_ptr);
+                // Ownership moved to `capture_allocations` when the pointer
+                // was allocated. The captured graph drains that pool and
+                // frees each pointer exactly once when the graph is dropped.
+                // Re-registering the pointer here duplicates ownership when
+                // a temporary slice drops before capture ends, and produces
+                // a double `cuMemFree` during graph teardown.
             }
         }
     }
@@ -2538,6 +2525,38 @@ mod tests {
             assert!(unsafe { view_mut.transmute::<f32>(26) }.is_none());
             assert!(unsafe { view_mut.transmute_mut::<f32>(25) }.is_some());
             assert!(unsafe { view_mut.transmute_mut::<f32>(26) }.is_none());
+        }
+    }
+
+    #[test]
+    fn capture_retained_allocations_have_one_owner() {
+        let ctx = CudaContext::new(0).unwrap();
+        let stream = ctx.default_stream();
+
+        unsafe { ctx.disable_async_alloc() };
+        ctx.enable_capture_retain();
+        let dropped_during_capture = unsafe { stream.alloc::<u8>(16) }.unwrap();
+        let dropped_after_capture = unsafe { stream.alloc::<u8>(32) }.unwrap();
+        drop(dropped_during_capture);
+
+        ctx.disable_capture_retain();
+        let retained = ctx.take_retained_ptrs();
+        unsafe { ctx.enable_async_alloc() };
+
+        let unique = retained
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(retained.len(), 2);
+        assert_eq!(unique.len(), retained.len());
+
+        // The allocation pool already transferred ownership to the graph.
+        // Dropping a surviving slice after capture must not register it again.
+        drop(dropped_after_capture);
+        assert!(ctx.take_retained_ptrs().is_empty());
+
+        for ptr in retained {
+            unsafe { result::free_sync(ptr) }.unwrap();
         }
     }
 
