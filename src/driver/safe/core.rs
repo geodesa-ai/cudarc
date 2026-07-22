@@ -308,6 +308,17 @@ impl CudaContext {
         self.is_in_multi_stream_mode() && self.is_event_tracking()
     }
 
+    /// Whether accesses should record their completion into persistent slice events.
+    ///
+    /// Pre-capture events remain valid dependencies and are still waited on while
+    /// capture is active. Recording into those events during capture would replace
+    /// them with capture-local handles that become invalid at `cuStreamEndCapture`,
+    /// so only recording is suspended until capture ends.
+    fn is_recording_stream_synchronization(&self) -> bool {
+        self.is_managing_stream_synchronization()
+            && !self.capture_retain.load(Ordering::Relaxed)
+    }
+
     /// When turned on, all [CudaSlice] **created after calling this function** will
     /// record usages using [CudaEvent] to ensure proper synchronization between streams.
     ///
@@ -719,13 +730,24 @@ pub(crate) enum AllocationKind {
     CaptureRetained,
 }
 
+impl AllocationKind {
+    /// Capture-retained allocations are owned by the graph after capture.
+    /// Their access events are capture-local and cannot be waited on once
+    /// `cuStreamEndCapture` has invalidated those event handles.
+    const fn waits_for_access_events_on_drop(self) -> bool {
+        !matches!(self, Self::CaptureRetained)
+    }
+}
+
 unsafe impl<T> Send for CudaSlice<T> {}
 unsafe impl<T> Sync for CudaSlice<T> {}
 
 impl<T> Drop for CudaSlice<T> {
     fn drop(&mut self) {
         let ctx = &self.stream.ctx;
-        if ctx.is_managing_stream_synchronization() {
+        if self.allocation.waits_for_access_events_on_drop()
+            && ctx.is_managing_stream_synchronization()
+        {
             if let Some(read) = self.read.as_ref() {
                 ctx.record_err(self.stream.wait(read));
             }
@@ -753,6 +775,19 @@ impl<T> Drop for CudaSlice<T> {
                 // a double `cuMemFree` during graph teardown.
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod allocation_kind_tests {
+    use super::AllocationKind;
+
+    #[test]
+    fn only_graph_owned_allocations_skip_drop_event_waits() {
+        assert!(AllocationKind::Empty.waits_for_access_events_on_drop());
+        assert!(AllocationKind::Async.waits_for_access_events_on_drop());
+        assert!(AllocationKind::Sync.waits_for_access_events_on_drop());
+        assert!(!AllocationKind::CaptureRetained.waits_for_access_events_on_drop());
     }
 }
 
@@ -1094,7 +1129,7 @@ pub enum SyncOnDrop<'a> {
 impl<'a> SyncOnDrop<'a> {
     /// Construct a [SyncOnDrop::Record] variant
     pub fn record_event(event: &'a Option<CudaEvent>, stream: &'a CudaStream) -> Self {
-        SyncOnDrop::Record(event.as_ref().map(|e| (e, stream)))
+        SyncOnDrop::Record(event.as_ref().map(|event| (event, stream)))
     }
     /// Construct a [SyncOnDrop::Sync] variant
     pub fn sync_stream(stream: &'a CudaStream) -> Self {
@@ -1107,7 +1142,9 @@ impl Drop for SyncOnDrop<'_> {
         match self {
             SyncOnDrop::Record(target) => {
                 if let Some((event, stream)) = std::mem::take(target) {
-                    stream.ctx.record_err(event.record(stream));
+                    if stream.ctx.is_recording_stream_synchronization() {
+                        stream.ctx.record_err(event.record(stream));
+                    }
                 }
             }
             SyncOnDrop::Sync(target) => {
@@ -2558,6 +2595,21 @@ mod tests {
         for ptr in retained {
             unsafe { result::free_sync(ptr) }.unwrap();
         }
+    }
+
+    #[test]
+    fn capture_retain_preserves_waits_but_suspends_event_recording() {
+        let ctx = CudaContext::new(0).unwrap();
+        let _stream = ctx.new_stream().unwrap();
+
+        assert!(ctx.is_managing_stream_synchronization());
+        assert!(ctx.is_recording_stream_synchronization());
+        ctx.enable_capture_retain();
+        assert!(ctx.is_managing_stream_synchronization());
+        assert!(!ctx.is_recording_stream_synchronization());
+        ctx.disable_capture_retain();
+        assert!(ctx.is_managing_stream_synchronization());
+        assert!(ctx.is_recording_stream_synchronization());
     }
 
     #[test]
