@@ -162,10 +162,9 @@ fn cuda_version_from_build_system() -> (usize, usize) {
     // newest minor version we do recognize for the detected major, so a
     // toolkit newer than our version table (e.g. 13.2 when we only list up
     // to 13.1) still builds instead of hard-failing on every check/build.
-    if let Some((detected_major, _)) = version_number
-        .split_once('.')
-        .and_then(|(major, minor)| Some((major.parse::<usize>().ok()?, minor.parse::<usize>().ok()?)))
-    {
+    if let Some((detected_major, _)) = version_number.split_once('.').and_then(|(major, minor)| {
+        Some((major.parse::<usize>().ok()?, minor.parse::<usize>().ok()?))
+    }) {
         if let Some(&(fallback, _)) = SUPPORTED_CUDA_VERSIONS
             .iter()
             .find(|&&((major, _), _)| major == detected_major)

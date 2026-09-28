@@ -378,6 +378,16 @@ impl CudaContext {
         self.is_in_multi_stream_mode() && self.is_event_tracking()
     }
 
+    /// Whether accesses should record their completion into persistent slice events.
+    ///
+    /// Pre-capture events remain valid dependencies and are still waited on while
+    /// capture is active. Recording into those events during capture would replace
+    /// them with capture-local handles that become invalid at `cuStreamEndCapture`,
+    /// so only recording is suspended until capture ends.
+    fn is_recording_stream_synchronization(&self) -> bool {
+        self.is_managing_stream_synchronization() && !self.capture_retain.load(Ordering::Relaxed)
+    }
+
     /// When turned on, all [CudaSlice] **created after calling this function** will
     /// record usages using [CudaEvent] to ensure proper synchronization between streams.
     ///
@@ -834,13 +844,24 @@ pub(crate) enum AllocationKind {
     CaptureTransient(usize),
 }
 
+impl AllocationKind {
+    /// Capture-retained allocations are owned by the graph after capture.
+    /// Their access events are capture-local and cannot be waited on once
+    /// `cuStreamEndCapture` has invalidated those event handles.
+    const fn waits_for_access_events_on_drop(self) -> bool {
+        !matches!(self, Self::CaptureRetained | Self::CaptureTransient(_))
+    }
+}
+
 unsafe impl<T> Send for CudaSlice<T> {}
 unsafe impl<T> Sync for CudaSlice<T> {}
 
 impl<T> Drop for CudaSlice<T> {
     fn drop(&mut self) {
         let ctx = &self.stream.ctx;
-        if ctx.is_managing_stream_synchronization() {
+        if self.allocation.waits_for_access_events_on_drop()
+            && ctx.is_managing_stream_synchronization()
+        {
             if let Some(read) = self.read.as_ref() {
                 ctx.record_err(self.stream.wait(read));
             }
@@ -878,6 +899,20 @@ impl<T> Drop for CudaSlice<T> {
                 // owner frees the allocation. Never register the pointer again.
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod allocation_kind_tests {
+    use super::AllocationKind;
+
+    #[test]
+    fn only_graph_owned_allocations_skip_drop_event_waits() {
+        assert!(AllocationKind::Empty.waits_for_access_events_on_drop());
+        assert!(AllocationKind::Async.waits_for_access_events_on_drop());
+        assert!(AllocationKind::Sync.waits_for_access_events_on_drop());
+        assert!(!AllocationKind::CaptureRetained.waits_for_access_events_on_drop());
+        assert!(!AllocationKind::CaptureTransient(1).waits_for_access_events_on_drop());
     }
 }
 
@@ -1237,7 +1272,7 @@ impl Drop for SyncOnDrop<'_> {
         match self {
             SyncOnDrop::Record(target) => {
                 if let Some((event, stream)) = std::mem::take(target) {
-                    if stream.ctx.is_event_tracking() {
+                    if stream.ctx.is_recording_stream_synchronization() {
                         stream.ctx.record_err(event.record(stream));
                     }
                 }
@@ -2860,6 +2895,60 @@ mod tests {
         for ptr in retained {
             unsafe { result::free_sync(ptr) }.unwrap();
         }
+    }
+
+    #[test]
+    fn capture_owned_slices_replay_with_event_tracking_enabled() {
+        let ctx = CudaContext::new(0).unwrap();
+        let primary = ctx.default_stream();
+        let capture = ctx.new_stream().unwrap();
+        primary.synchronize().unwrap();
+        unsafe { ctx.disable_async_alloc() };
+        ctx.enable_capture_retain();
+        capture
+            .begin_capture(sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_RELAXED)
+            .unwrap();
+        // Keep this test focused on capture-owned events. Borrowing an
+        // externally recorded event into an active capture is a separate
+        // stream dependency contract (the engine disables such tracking).
+        let mut output = capture.alloc_zeros::<u32>(32).unwrap();
+        let retained = capture.alloc_zeros::<u32>(32).unwrap();
+        let transient = capture.alloc_zeros_capture_transient::<u32>(32).unwrap();
+        assert!(retained.read.is_some() && transient.read.is_some());
+        capture.memcpy_dtod(&retained, &mut output).unwrap();
+        capture.memcpy_dtod(&transient, &mut output).unwrap();
+        drop(retained);
+        let graph = capture.end_capture_graph().unwrap().unwrap();
+        ctx.disable_capture_retain();
+        let leases = ctx.take_retained_allocation_leases();
+        // Exercise the other allocation kind after capture has ended.
+        drop(transient);
+        ctx.check_err().unwrap();
+        let exec = graph.instantiate_raw(0).unwrap();
+        for _ in 0..2 {
+            exec.launch(&primary).unwrap();
+            assert_eq!(primary.clone_dtoh(&output).unwrap(), vec![0u32; 32]);
+        }
+        primary.synchronize().unwrap();
+        drop(exec);
+        drop(graph);
+        drop(leases);
+        ctx.check_err().unwrap();
+    }
+
+    #[test]
+    fn capture_retain_preserves_waits_but_suspends_event_recording() {
+        let ctx = CudaContext::new(0).unwrap();
+        let _stream = ctx.new_stream().unwrap();
+
+        assert!(ctx.is_managing_stream_synchronization());
+        assert!(ctx.is_recording_stream_synchronization());
+        ctx.enable_capture_retain();
+        assert!(ctx.is_managing_stream_synchronization());
+        assert!(!ctx.is_recording_stream_synchronization());
+        ctx.disable_capture_retain();
+        assert!(ctx.is_managing_stream_synchronization());
+        assert!(ctx.is_recording_stream_synchronization());
     }
 
     #[test]

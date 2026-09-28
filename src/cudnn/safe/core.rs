@@ -43,10 +43,10 @@ impl Drop for Cudnn {
     fn drop(&mut self) {
         let handle = std::mem::replace(&mut self.handle, std::ptr::null_mut());
         if !handle.is_null() {
-            if let Err(e) = unsafe { result::destroy_handle(handle) } {
+            if let Err(_error) = unsafe { result::destroy_handle(handle) } {
                 // Log but don't panic - Drop should not panic
                 #[cfg(feature = "std")]
-                eprintln!("cudarc: failed to destroy cudnn handle: {:?}", e);
+                eprintln!("cudarc: failed to destroy cudnn handle: {:?}", _error);
             }
         }
     }
@@ -179,10 +179,10 @@ impl<T> Drop for TensorDescriptor<T> {
     fn drop(&mut self) {
         let desc = std::mem::replace(&mut self.desc, std::ptr::null_mut());
         if !desc.is_null() {
-            if let Err(e) = unsafe { result::destroy_tensor_descriptor(desc) } {
+            if let Err(_error) = unsafe { result::destroy_tensor_descriptor(desc) } {
                 // Log but don't panic - Drop should not panic
                 #[cfg(feature = "std")]
-                eprintln!("cudarc: failed to destroy tensor descriptor: {:?}", e);
+                eprintln!("cudarc: failed to destroy tensor descriptor: {:?}", _error);
             }
         }
     }

@@ -1375,6 +1375,7 @@ pub mod external_memory {
 
 pub mod graph {
     use super::*;
+    use std::{vec, vec::Vec};
 
     /// See [cuda docs](https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__GRAPH.html#group__CUDA__GRAPH_1gb53b435e178cccfa37ac87285d2c3fa1)
     /// # Safety
@@ -1396,8 +1397,7 @@ pub mod graph {
         flags: u64,
     ) -> Result<sys::CUgraphExec, DriverError> {
         let mut graph_exec = MaybeUninit::uninit();
-        sys::cuGraphInstantiateWithFlags(graph_exec.as_mut_ptr(), graph, flags)
-            .result()?;
+        sys::cuGraphInstantiateWithFlags(graph_exec.as_mut_ptr(), graph, flags).result()?;
         Ok(graph_exec.assume_init())
     }
 

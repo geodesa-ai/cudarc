@@ -1,8 +1,9 @@
 #[cfg(test)]
 mod tests {
-    use crate::cutensor::safe::{CuTensor, TensorDescriptor};
+    use crate::cutensor::safe::CuTensor;
     use crate::cutensor::sys::cudaDataType_t;
     use crate::driver::CudaContext;
+    use std::vec;
 
     #[test]
     fn test_handle_creation() {
@@ -11,10 +12,6 @@ mod tests {
 
         let cutensor = CuTensor::new(stream.clone()).unwrap();
         let version = cutensor.version();
-        println!(
-            "cuTENSOR version: {}.{}.{}",
-            version.0, version.1, version.2
-        );
 
         assert!(version.0 > 0);
     }

@@ -395,6 +395,7 @@ mod tests {
     };
     use crate::driver::safe::core::DevicePtr;
     use crate::driver::{CudaContext, CudaSlice, CudaStream};
+    use std::{vec, vec::Vec};
 
     fn get_ptr<T>(slice: &CudaSlice<T>, stream: &CudaStream) -> *mut T {
         slice.device_ptr(stream).0 as *mut T
