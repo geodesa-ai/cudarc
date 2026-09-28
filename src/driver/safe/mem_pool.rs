@@ -311,7 +311,7 @@ impl CudaStream {
     /// let pool = ctx.default_mem_pool()?;
     /// let data: CudaSlice<f32> = unsafe { stream.alloc_from_pool(1000, &pool)? };
     /// ```
-    pub unsafe fn alloc_from_pool<T: ValidAsZeroBits>(
+    pub unsafe fn alloc_from_pool<T: DeviceRepr>(
         self: &Arc<Self>,
         len: usize,
         pool: &CudaMemPool,
@@ -321,7 +321,9 @@ impl CudaStream {
             return self.null();
         }
 
-        let num_bytes = len * std::mem::size_of::<T>();
+        let num_bytes = len
+            .checked_mul(std::mem::size_of::<T>())
+            .ok_or(DriverError(sys::cudaError_enum::CUDA_ERROR_INVALID_VALUE))?;
         let cu_device_ptr = result::mem_pool::alloc_async(pool.cu_pool, num_bytes, self.cu_stream)?;
 
         let (read, write) = if self.ctx.is_event_tracking() {
@@ -339,6 +341,7 @@ impl CudaStream {
             read,
             write,
             stream: self.clone(),
+            capture_lease: None,
             allocation: AllocationKind::Async,
             marker: PhantomData,
         })

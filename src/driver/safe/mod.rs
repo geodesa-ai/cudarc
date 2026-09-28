@@ -9,9 +9,9 @@ pub(crate) mod profile;
 pub(crate) mod unified_memory;
 
 pub use self::core::{
-    CudaContext, CudaEvent, CudaFunction, CudaModule, CudaSlice, CudaStream, CudaView, CudaViewMut,
-    DevicePtr, DevicePtrMut, DeviceRepr, DeviceSlice, HostSlice, PinnedHostSlice, SyncOnDrop,
-    TryClone, ValidAsZeroBits,
+    CaptureAllocationLease, CudaContext, CudaEvent, CudaFunction, CudaModule, CudaSlice,
+    CudaStream, CudaView, CudaViewMut, DevicePtr, DevicePtrMut, DeviceRepr, DeviceSlice, HostSlice,
+    PinnedHostSlice, SyncOnDrop, TryClone, ValidAsZeroBits,
 };
 pub use self::external_memory::{ExternalMemory, MappedBuffer};
 #[allow(deprecated)]
