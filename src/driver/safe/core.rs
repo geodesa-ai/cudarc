@@ -15,7 +15,53 @@ use std::{
 
 #[derive(Debug, Default)]
 pub(crate) struct CaptureAllocationPool {
-    all: Vec<(sys::CUdeviceptr, usize)>,
+    generation: usize,
+    all: std::collections::HashMap<sys::CUdeviceptr, Arc<CaptureAllocation>>,
+    reusable: std::collections::HashMap<(usize, usize), Vec<sys::CUdeviceptr>>,
+}
+
+/// Shared ownership of one physical capture allocation. Graphs and escaping
+/// slices both retain a lease; the allocation is freed only after the last one.
+#[derive(Clone, Debug)]
+pub struct CaptureAllocationLease {
+    allocation: Arc<CaptureAllocation>,
+    // Declared after allocation so the context outlives its final free.
+    _context: Arc<CudaContext>,
+}
+
+impl CaptureAllocationLease {
+    pub fn bytes(&self) -> usize {
+        self.allocation.bytes
+    }
+    pub fn device_ptr(&self) -> sys::CUdeviceptr {
+        self.allocation.ptr
+    }
+    /// Detach automatic freeing and transfer raw ownership to a legacy caller.
+    /// The caller must not free this pointer while any slice still uses it.
+    pub fn into_raw(self) -> (sys::CUdeviceptr, usize) {
+        self.allocation
+            .externally_owned
+            .store(true, Ordering::Relaxed);
+        (self.allocation.ptr, self.allocation.bytes)
+    }
+}
+
+#[derive(Debug)]
+struct CaptureAllocation {
+    ptr: sys::CUdeviceptr,
+    bytes: usize,
+    context: std::sync::Weak<CudaContext>,
+    externally_owned: AtomicBool,
+}
+impl Drop for CaptureAllocation {
+    fn drop(&mut self) {
+        if !self.externally_owned.load(Ordering::Relaxed) {
+            if let Some(context) = self.context.upgrade() {
+                context.record_err(context.bind_to_thread());
+                context.record_err(unsafe { result::free_sync(self.ptr) });
+            }
+        }
+    }
 }
 
 /// Represents a primary cuda context on a certain device. When created with [CudaContext::new()] it will
@@ -43,9 +89,9 @@ pub struct CudaContext {
     /// Sync allocations made while graph capture-retain mode is active.
     ///
     /// CUDA graph kernel args bake allocation addresses into the graph. Each
-    /// sync allocation made during capture must remain unique and live for the
-    /// graph lifetime; reusing a dropped allocation for later graph metadata
-    /// mutates arguments that earlier graph nodes still read during replay.
+    /// allocation is shared by the pool/graph and escaping slices. Constants keep unique
+    /// addresses; explicitly transient storage can reuse a dropped address when
+    /// its contents are redefined by recorded operations on the same stream.
     pub(crate) capture_allocations: std::sync::Mutex<CaptureAllocationPool>,
 }
 
@@ -55,6 +101,26 @@ unsafe impl Sync for CudaContext {}
 impl Drop for CudaContext {
     fn drop(&mut self) {
         self.record_err(self.bind_to_thread());
+        // An abandoned capture pool only holds weak context references. At
+        // this point Weak::upgrade cannot succeed, so drain it explicitly
+        // before releasing our primary-context reference. Another CudaContext
+        // may still retain that same primary context.
+        let abandoned = {
+            let pool = self
+                .capture_allocations
+                .get_mut()
+                .unwrap_or_else(|e| e.into_inner());
+            pool.reusable.clear();
+            std::mem::take(&mut pool.all)
+        };
+        if !abandoned.is_empty() {
+            self.record_err(self.synchronize());
+            for allocation in abandoned.into_values() {
+                if !allocation.externally_owned.swap(true, Ordering::Relaxed) {
+                    self.record_err(unsafe { result::free_sync(allocation.ptr) });
+                }
+            }
+        }
         let ctx = std::mem::replace(&mut self.cu_ctx, std::ptr::null_mut());
         if !ctx.is_null() {
             self.record_err(unsafe { result::primary_ctx::release(self.cu_device) });
@@ -111,7 +177,11 @@ impl CudaContext {
             device = ordinal,
             async_alloc = has_async_alloc,
             "CUDA device init: async alloc (cudaMallocAsync / memory pools) {}",
-            if has_async_alloc { "ENABLED (SM8+)" } else { "DISABLED (pre-SM8 or pools unsupported)" }
+            if has_async_alloc {
+                "ENABLED (SM8+)"
+            } else {
+                "DISABLED (pre-SM8 or pools unsupported)"
+            }
         );
         Ok(ctx)
     }
@@ -321,8 +391,8 @@ impl CudaContext {
         self.event_tracking.store(true, Ordering::Relaxed);
     }
 
-    /// When turned on, all [CudaSlice] **created after calling this function** will
-    /// not track uses via [CudaEvent]s.
+    /// Disable automatic event waits and records, including for existing slices.
+    /// Slices created while disabled have no tracking events when re-enabled.
     ///
     /// # Safety
     ///
@@ -335,21 +405,23 @@ impl CudaContext {
         self.event_tracking.store(false, Ordering::Relaxed);
     }
 
-    /// Enable capture-retain mode for CUDA graph capture.
+    /// Retain synchronous allocations for CUDA graph capture.
     ///
-    /// When enabled:
-    /// - `CudaSlice::Drop` retains memory instead of freeing it
-    /// - `cuMemAllocAsync` continues normally (captured as graph memory nodes)
-    /// - `CudaSlice::Drop` retains pointers instead of calling `cuMemFreeAsync`
+    /// Pair this with `disable_async_alloc` for stable addresses allocated
+    /// outside the graph. Synchronous allocations receive shared leases held by
+    /// the pool and their slices; explicitly transient storage can be reused
+    /// after its recorded uses finish. Ordinary async allocations are unchanged.
     ///
-    /// This produces a graph with MEM_ALLOC + KERNEL nodes but no MEM_FREE
-    /// nodes. On replay, the CUDA runtime reuses the same virtual addresses
-    /// for graph memory allocations, so kernel arguments remain valid.
-    ///
-    /// Call [`take_retained_ptrs`](Self::take_retained_ptrs) after capture to
-    /// get the retained pointers, and free them when the graph is destroyed.
+    /// After capture, disable this mode and transfer pool ownership with
+    /// `take_retained_allocation_leases`. Graphs and escaping slices can then
+    /// independently retain those allocations. Legacy raw-pointer transfers
+    /// instead make the caller responsible for freeing after all uses finish.
     pub fn enable_capture_retain(&self) {
-        *self.capture_allocations.lock().unwrap() = CaptureAllocationPool::default();
+        static NEXT_GENERATION: AtomicUsize = AtomicUsize::new(1);
+        *self.capture_allocations.lock().unwrap() = CaptureAllocationPool {
+            generation: NEXT_GENERATION.fetch_add(1, Ordering::Relaxed),
+            ..CaptureAllocationPool::default()
+        };
         self.capture_retain.store(true, Ordering::Relaxed);
     }
 
@@ -366,17 +438,58 @@ impl CudaContext {
     /// these pointers and must free them (via `cuMemFree`) when the captured
     /// graph is no longer needed.
     pub fn take_retained_ptrs(&self) -> Vec<sys::CUdeviceptr> {
-        let mut pool = self.capture_allocations.lock().unwrap();
-        std::mem::take(&mut pool.all)
+        self.take_retained_allocations()
             .into_iter()
-            .map(|(ptr, _bytes)| ptr)
+            .map(|(ptr, _)| ptr)
             .collect()
     }
 
-    pub(crate) fn capture_alloc_sync(&self, bytes: usize) -> Result<sys::CUdeviceptr, DriverError> {
-        let ptr = unsafe { result::malloc_sync(bytes) }?;
+    /// Transfer capture allocation ownership with each physical allocation's
+    /// byte capacity. Reused transient pointers appear only once. The caller
+    /// must free every pointer after all graph uses have completed.
+    pub fn take_retained_allocations(&self) -> Vec<(sys::CUdeviceptr, usize)> {
         let mut pool = self.capture_allocations.lock().unwrap();
-        pool.all.push((ptr, bytes));
+        pool.reusable.clear();
+        std::mem::take(&mut pool.all)
+            .into_values()
+            .map(|allocation| {
+                // This legacy API transfers raw ownership to the caller. Its
+                // explicitly unsafe free must still respect all surviving slices.
+                allocation.externally_owned.store(true, Ordering::Relaxed);
+                (allocation.ptr, allocation.bytes)
+            })
+            .collect()
+    }
+
+    /// Transfer graph ownership without invalidating slices escaping capture.
+    pub fn take_retained_allocation_leases(self: &Arc<Self>) -> Vec<CaptureAllocationLease> {
+        let mut pool = self.capture_allocations.lock().unwrap();
+        pool.reusable.clear();
+        std::mem::take(&mut pool.all)
+            .into_values()
+            .map(|allocation| CaptureAllocationLease {
+                allocation,
+                _context: self.clone(),
+            })
+            .collect()
+    }
+
+    pub(crate) fn capture_alloc_sync(
+        self: &Arc<Self>,
+        bytes: usize,
+    ) -> Result<sys::CUdeviceptr, DriverError> {
+        let ptr = unsafe { result::malloc_sync(bytes) }?;
+        let allocation = Arc::new(CaptureAllocation {
+            ptr,
+            bytes,
+            context: Arc::downgrade(self),
+            externally_owned: AtomicBool::new(false),
+        });
+        self.capture_allocations
+            .lock()
+            .unwrap()
+            .all
+            .insert(ptr, allocation);
         Ok(ptr)
     }
 
@@ -707,6 +820,7 @@ pub struct CudaSlice<T> {
     pub(crate) read: Option<CudaEvent>,
     pub(crate) write: Option<CudaEvent>,
     pub(crate) stream: Arc<CudaStream>,
+    pub(crate) capture_lease: Option<CaptureAllocationLease>,
     pub(crate) allocation: AllocationKind,
     pub(crate) marker: PhantomData<*const T>,
 }
@@ -717,6 +831,7 @@ pub(crate) enum AllocationKind {
     Async,
     Sync,
     CaptureRetained,
+    CaptureTransient(usize),
 }
 
 unsafe impl<T> Send for CudaSlice<T> {}
@@ -744,13 +859,23 @@ impl<T> Drop for CudaSlice<T> {
                 ctx.record_err(self.stream.synchronize());
                 ctx.record_err(unsafe { result::free_sync(self.cu_device_ptr) });
             }
+            AllocationKind::CaptureTransient(generation) => {
+                if ctx.capture_retain.load(Ordering::Relaxed) {
+                    let mut pool = ctx.capture_allocations.lock().unwrap();
+                    if pool.generation == generation {
+                        pool.reusable
+                            .entry((self.stream.cu_stream as usize, self.num_bytes()))
+                            .or_default()
+                            .push(self.cu_device_ptr);
+                    }
+                }
+                // The pool/graph lease keeps a reused allocation alive. This
+                // slice also owns a lease until its fields are dropped below.
+            }
             AllocationKind::CaptureRetained => {
-                // Ownership moved to `capture_allocations` when the pointer
-                // was allocated. The captured graph drains that pool and
-                // frees each pointer exactly once when the graph is dropped.
-                // Re-registering the pointer here duplicates ownership when
-                // a temporary slice drops before capture ends, and produces
-                // a double `cuMemFree` during graph teardown.
+                // Pool, graph and escaping slices share the allocation lease.
+                // Dropping this slice releases only its own lease; the final
+                // owner frees the allocation. Never register the pointer again.
             }
         }
     }
@@ -1094,7 +1219,12 @@ pub enum SyncOnDrop<'a> {
 impl<'a> SyncOnDrop<'a> {
     /// Construct a [SyncOnDrop::Record] variant
     pub fn record_event(event: &'a Option<CudaEvent>, stream: &'a CudaStream) -> Self {
-        SyncOnDrop::Record(event.as_ref().map(|e| (e, stream)))
+        SyncOnDrop::Record(
+            event
+                .as_ref()
+                .filter(|_| stream.ctx.is_event_tracking())
+                .map(|e| (e, stream)),
+        )
     }
     /// Construct a [SyncOnDrop::Sync] variant
     pub fn sync_stream(stream: &'a CudaStream) -> Self {
@@ -1107,7 +1237,9 @@ impl Drop for SyncOnDrop<'_> {
         match self {
             SyncOnDrop::Record(target) => {
                 if let Some((event, stream)) = std::mem::take(target) {
-                    stream.ctx.record_err(event.record(stream));
+                    if stream.ctx.is_event_tracking() {
+                        stream.ctx.record_err(event.record(stream));
+                    }
                 }
             }
             SyncOnDrop::Sync(target) => {
@@ -1456,6 +1588,7 @@ impl CudaStream {
             read,
             write,
             stream: self.clone(),
+            capture_lease: None,
             allocation: AllocationKind::Empty,
             marker: PhantomData,
         })
@@ -1475,12 +1608,29 @@ impl CudaStream {
         } else {
             (None, None)
         };
+        let capture_lease = if matches!(
+            allocation,
+            AllocationKind::CaptureRetained | AllocationKind::CaptureTransient(_)
+        ) {
+            let pool = self.ctx.capture_allocations.lock().unwrap();
+            Some(CaptureAllocationLease {
+                allocation: pool
+                    .all
+                    .get(&cu_device_ptr)
+                    .expect("capture allocation registered")
+                    .clone(),
+                _context: self.ctx.clone(),
+            })
+        } else {
+            None
+        };
         Ok(CudaSlice {
             cu_device_ptr,
             len,
             read,
             write,
             stream: self.clone(),
+            capture_lease,
             allocation,
             marker: PhantomData,
         })
@@ -1514,6 +1664,43 @@ impl CudaStream {
             (result::malloc_sync(bytes)?, AllocationKind::Sync)
         };
         self.slice_from_allocation(cu_device_ptr, len, allocation)
+    }
+
+    /// Allocate transient storage whose contents are produced by captured work.
+    /// Outside synchronous capture-retain mode this delegates to ordinary allocation.
+    ///
+    /// # Safety
+    /// Memory is uninitialized. During capture, all reads/writes must be recorded
+    /// on this stream, and all uses must end before the slice is dropped. Do not
+    /// use this for constants initialized outside the graph or immutable metadata.
+    pub unsafe fn alloc_capture_transient<T: DeviceRepr>(
+        self: &Arc<Self>,
+        len: usize,
+    ) -> Result<CudaSlice<T>, DriverError> {
+        if len == 0
+            || !self.ctx.capture_retain.load(Ordering::Relaxed)
+            || self.ctx.has_async_alloc.load(Ordering::Relaxed)
+        {
+            return unsafe { self.alloc(len) };
+        }
+        self.ctx.bind_to_thread()?;
+        let bytes = len
+            .checked_mul(std::mem::size_of::<T>())
+            .ok_or(DriverError(sys::cudaError_enum::CUDA_ERROR_INVALID_VALUE))?;
+        let (reused, generation) = {
+            let mut pool = self.ctx.capture_allocations.lock().unwrap();
+            (
+                pool.reusable
+                    .get_mut(&(self.cu_stream as usize, bytes))
+                    .and_then(|free| free.pop()),
+                pool.generation,
+            )
+        };
+        let ptr = match reused {
+            Some(ptr) => ptr,
+            None => self.ctx.capture_alloc_sync(bytes)?,
+        };
+        self.slice_from_allocation(ptr, len, AllocationKind::CaptureTransient(generation))
     }
 
     /// Allocate with synchronous `cuMemAlloc`, bypassing the async memory pool.
@@ -1550,6 +1737,18 @@ impl CudaStream {
         len: usize,
     ) -> Result<CudaSlice<T>, DriverError> {
         let mut dst = unsafe { self.alloc_sync(len) }?;
+        self.memset_zeros(&mut dst)?;
+        Ok(dst)
+    }
+
+    /// Zero-initialized temporary storage produced by captured operations.
+    /// Unlike ordinary allocations, dead temporaries can share storage within
+    /// one capture. The memset is recorded before any consumer on this stream.
+    pub fn alloc_zeros_capture_transient<T: DeviceRepr + ValidAsZeroBits>(
+        self: &Arc<Self>,
+        len: usize,
+    ) -> Result<CudaSlice<T>, DriverError> {
+        let mut dst = unsafe { self.alloc_capture_transient(len) }?;
         self.memset_zeros(&mut dst)?;
         Ok(dst)
     }
@@ -2435,7 +2634,10 @@ impl<T> CudaSlice<T> {
     /// Takes ownership of the underlying [sys::CUdeviceptr]. **It is up
     /// to the owner to free this value**.
     ///
-    /// Drops the underlying host_buf if there is one.
+    /// For captured storage, this transfers raw ownership for every lease on
+    /// the allocation. Graphs and other leases stop freeing it automatically.
+    /// The caller must keep it alive until all graph and slice uses finish,
+    /// including before dropping an owner made with `upgrade_device_ptr`.
     pub fn leak(self) -> sys::CUdeviceptr {
         let mut s = std::mem::ManuallyDrop::new(self);
         let ptr = s.cu_device_ptr;
@@ -2446,6 +2648,12 @@ impl<T> CudaSlice<T> {
         }
         if let Some(write) = s.write.as_ref() {
             s.stream.ctx.record_err(s.stream.wait(write));
+        }
+
+        // Transfer ownership before releasing this lease: dropping it normally
+        // could free the pointer now or leave a graph lease to free it later.
+        if let Some(lease) = s.capture_lease.take() {
+            let _ = lease.into_raw();
         }
 
         // Manually drop fields that own resources.
@@ -2487,6 +2695,7 @@ impl CudaStream {
             read,
             write,
             stream: self.clone(),
+            capture_lease: None,
             allocation: if self.ctx.has_async_alloc.load(Ordering::Relaxed) {
                 AllocationKind::Async
             } else {
@@ -2526,6 +2735,99 @@ mod tests {
             assert!(unsafe { view_mut.transmute_mut::<f32>(25) }.is_some());
             assert!(unsafe { view_mut.transmute_mut::<f32>(26) }.is_none());
         }
+    }
+
+    #[test]
+    fn abandoned_capture_pool_releases_memory_with_shared_primary_context() {
+        let survivor = CudaContext::new(0).unwrap();
+        let abandoned = CudaContext::new(0).unwrap();
+        let stream = abandoned.new_stream().unwrap();
+        unsafe { abandoned.disable_async_alloc() };
+        abandoned.enable_capture_retain();
+        let slice = stream.alloc_zeros_capture_transient::<u32>(32).unwrap();
+        let weak = Arc::downgrade(&slice.capture_lease.as_ref().unwrap().allocation);
+        drop(slice);
+        drop(stream);
+        // No end-capture ownership transfer: context teardown must drain pool.
+        drop(abandoned);
+        assert!(weak.upgrade().is_none());
+        survivor.synchronize().unwrap();
+    }
+
+    #[test]
+    fn retained_leases_keep_escaped_slice_alive_and_free_last_owner() {
+        let ctx = CudaContext::new(0).unwrap();
+        let stream = ctx.new_stream().unwrap();
+        unsafe { ctx.disable_async_alloc() };
+        ctx.enable_capture_retain();
+        let slice = stream.alloc_zeros_capture_transient::<u32>(32).unwrap();
+        let weak = Arc::downgrade(&slice.capture_lease.as_ref().unwrap().allocation);
+        ctx.disable_capture_retain();
+        let leases = ctx.take_retained_allocation_leases();
+        assert_eq!(leases.len(), 1);
+        assert_eq!(leases[0].bytes(), 128);
+        drop(leases);
+        assert!(weak.upgrade().is_some());
+        assert_eq!(stream.clone_dtoh(&slice).unwrap(), vec![0u32; 32]);
+        drop(slice);
+        assert!(weak.upgrade().is_none());
+        unsafe { ctx.enable_async_alloc() };
+    }
+
+    #[test]
+    fn transient_capture_reuse_preserves_constants_and_stream_ownership() {
+        let ctx = CudaContext::new(0).unwrap();
+        let stream = ctx.new_stream().unwrap();
+        let other = ctx.new_stream().unwrap();
+        unsafe { ctx.disable_async_alloc() };
+        ctx.enable_capture_retain();
+        let temporary = unsafe { stream.alloc_capture_transient::<u8>(32) }.unwrap();
+        let ptr = temporary.cu_device_ptr;
+        drop(temporary);
+        let constant = unsafe { stream.alloc::<u8>(32) }.unwrap();
+        assert_ne!(constant.cu_device_ptr, ptr);
+        let cross_stream = unsafe { other.alloc_capture_transient::<u8>(32) }.unwrap();
+        assert_ne!(cross_stream.cu_device_ptr, ptr);
+        let reused = unsafe { stream.alloc_capture_transient::<u8>(32) }.unwrap();
+        assert_eq!(reused.cu_device_ptr, ptr);
+        ctx.disable_capture_retain();
+        let first = ctx.take_retained_ptrs();
+        assert_eq!(first.len(), 3);
+        ctx.enable_capture_retain();
+        // A slice escaping the prior capture cannot enter the new free list.
+        drop(reused);
+        let next = unsafe { stream.alloc_capture_transient::<u8>(32) }.unwrap();
+        assert_ne!(next.cu_device_ptr, ptr);
+        ctx.disable_capture_retain();
+        let second = ctx.take_retained_ptrs();
+        drop((constant, cross_stream, next));
+        assert_eq!(second.len(), 1);
+        unsafe { ctx.enable_async_alloc() };
+        for ptr in first.into_iter().chain(second) {
+            unsafe { result::free_sync(ptr) }.unwrap();
+        }
+    }
+
+    #[test]
+    fn disabled_tracking_preserves_existing_events_across_capture() {
+        let ctx = CudaContext::new(0).unwrap();
+        let primary = ctx.default_stream();
+        let capture = ctx.new_stream().unwrap();
+        let src = primary.clone_htod(&[1u32, 2, 3, 4]).unwrap();
+        let mut dst = primary.clone_htod(&[0u32; 4]).unwrap();
+        primary.synchronize().unwrap();
+        unsafe { ctx.disable_event_tracking() };
+        capture
+            .begin_capture(sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_RELAXED)
+            .unwrap();
+        capture.memcpy_dtod(&src, &mut dst).unwrap();
+        let graph = capture.end_capture_graph().unwrap().unwrap();
+        unsafe { ctx.enable_event_tracking() };
+        let exec = graph.instantiate_raw(0).unwrap();
+        exec.launch(&primary).unwrap();
+        assert_eq!(primary.clone_dtoh(&dst).unwrap(), [1, 2, 3, 4]);
+        primary.memcpy_htod(&[5u32, 6, 7, 8], &mut dst).unwrap();
+        assert_eq!(primary.clone_dtoh(&dst).unwrap(), [5, 6, 7, 8]);
     }
 
     #[test]
@@ -2647,6 +2949,40 @@ mod tests {
             stream.clone_dtoh(&big).unwrap(),
             [-1.0, -0.8, -0.6, -0.4, -0.2, 0.0, 0.2, 0.4, 0.6, 0.8]
         );
+    }
+
+    #[test]
+    fn captured_slice_leak_transfers_ownership_without_leaking_context() {
+        for upgrade_owner in [false, true] {
+            let ctx = CudaContext::new(0).unwrap();
+            let weak_context = Arc::downgrade(&ctx);
+            let stream = ctx.new_stream().unwrap();
+            unsafe { ctx.disable_async_alloc() };
+            ctx.enable_capture_retain();
+            let slice = stream.alloc_zeros_capture_transient::<u32>(32).unwrap();
+            let weak_allocation = Arc::downgrade(&slice.capture_lease.as_ref().unwrap().allocation);
+            ctx.disable_capture_retain();
+            let graph_leases = ctx.take_retained_allocation_leases();
+            let ptr = slice.leak();
+            // Leaking the slice transfers ownership without dropping live
+            // graph leases. Their later destruction must not free this pointer.
+            assert!(weak_allocation.upgrade().is_some());
+            drop(graph_leases);
+            assert!(weak_allocation.upgrade().is_none());
+            // SAFETY: All graph leases are gone; the raw owner remains valid.
+            let owner = unsafe { stream.upgrade_device_ptr::<u32>(ptr, 32) };
+            assert_eq!(stream.clone_dtoh(&owner).unwrap(), vec![0u32; 32]);
+            if upgrade_owner {
+                drop(owner);
+            } else {
+                let raw = owner.leak();
+                stream.synchronize().unwrap();
+                unsafe { result::free_sync(raw) }.unwrap();
+            }
+            drop(stream);
+            drop(ctx);
+            assert!(weak_context.upgrade().is_none());
+        }
     }
 
     #[test]

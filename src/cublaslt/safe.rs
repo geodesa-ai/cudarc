@@ -370,6 +370,25 @@ pub trait Matmul<T>: MatmulShared {
         bias: Option<&I>,
         act: Option<&Activation>,
     ) -> Result<(), CublasError> {
+        self.matmul_with_compute_type(cfg, a, b, c, bias, act, Self::compute_type())
+    }
+
+    /// Matrix multiplication with an explicit CUDA accumulation/input precision.
+    /// Existing `matmul` callers retain the element type's default compute mode.
+    ///
+    /// # Safety
+    /// In addition to `matmul`'s memory requirements, `compute_type` must be
+    /// supported for the element type and selected CUDA device.
+    unsafe fn matmul_with_compute_type<I: DevicePtr<T>, O: DevicePtrMut<T>>(
+        &self,
+        cfg: MatmulConfig,
+        a: &I,
+        b: &I,
+        c: &mut O,
+        bias: Option<&I>,
+        act: Option<&Activation>,
+        compute_type: sys::cublasComputeType_t,
+    ) -> Result<(), CublasError> {
         let stream = self.stream();
         let workspace = self.workspace();
 
@@ -401,7 +420,7 @@ pub trait Matmul<T>: MatmulShared {
         }
 
         // Matmul description
-        let matmul_desc = MatmulDesc::new(Self::compute_type(), sys::cudaDataType_t::CUDA_R_32F)?;
+        let matmul_desc = MatmulDesc::new(compute_type, sys::cudaDataType_t::CUDA_R_32F)?;
 
         // Set transa
         matmul_desc.set_transpose(cfg.transa, Matrix::A)?;
