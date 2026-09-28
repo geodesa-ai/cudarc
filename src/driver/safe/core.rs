@@ -2743,7 +2743,7 @@ impl CudaStream {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Instant;
+    use std::{time::Instant, vec};
 
     use super::*;
 

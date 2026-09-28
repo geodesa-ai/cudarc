@@ -347,6 +347,28 @@ pub struct MatmulConfig {
     pub batch_size: Option<c_int>,
 }
 
+/// Matrix geometry with an explicit accumulation and input precision policy.
+/// Created by [`MatmulConfig::with_compute_type`].
+#[derive(Debug, Copy, Clone)]
+pub struct MatmulConfigWithComputeType {
+    pub config: MatmulConfig,
+    pub compute_type: sys::cublasComputeType_t,
+}
+
+impl MatmulConfig {
+    /// Select a compute mode without changing matrix layouts or epilogues.
+    /// The mode must support the element type and device used by the matmul.
+    pub fn with_compute_type(
+        self,
+        compute_type: sys::cublasComputeType_t,
+    ) -> MatmulConfigWithComputeType {
+        MatmulConfigWithComputeType {
+            config: self,
+            compute_type,
+        }
+    }
+}
+
 /// Matrix matrix multiplication with elements of type `T`.
 pub trait Matmul<T>: MatmulShared {
     /// Underlying CUDA Type for `T`
@@ -370,7 +392,14 @@ pub trait Matmul<T>: MatmulShared {
         bias: Option<&I>,
         act: Option<&Activation>,
     ) -> Result<(), CublasError> {
-        self.matmul_with_compute_type(cfg, a, b, c, bias, act, Self::compute_type())
+        self.matmul_with_compute_type(
+            cfg.with_compute_type(Self::compute_type()),
+            a,
+            b,
+            c,
+            bias,
+            act,
+        )
     }
 
     /// Matrix multiplication with an explicit CUDA accumulation/input precision.
@@ -381,14 +410,17 @@ pub trait Matmul<T>: MatmulShared {
     /// supported for the element type and selected CUDA device.
     unsafe fn matmul_with_compute_type<I: DevicePtr<T>, O: DevicePtrMut<T>>(
         &self,
-        cfg: MatmulConfig,
+        cfg: MatmulConfigWithComputeType,
         a: &I,
         b: &I,
         c: &mut O,
         bias: Option<&I>,
         act: Option<&Activation>,
-        compute_type: sys::cublasComputeType_t,
     ) -> Result<(), CublasError> {
+        let MatmulConfigWithComputeType {
+            config: cfg,
+            compute_type,
+        } = cfg;
         let stream = self.stream();
         let workspace = self.workspace();
 
