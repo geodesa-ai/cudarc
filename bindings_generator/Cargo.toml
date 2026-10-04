@@ -14,6 +14,7 @@ log = "0.4.27"
 prettyplease = "0.2.31"
 proc-macro2 = "1.0.94"
 quote = "1.0.40"
+rayon = "1"
 reqwest = { version = "0.12.15", features = ["blocking"] }
 serde_json = "1.0.140"
 sha2 = "0.10.8"

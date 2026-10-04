@@ -19,7 +19,7 @@
 //! CUDA Versions supported
 //! - 11.4-11.8
 //! - 12.0-12.9
-//! - 13.0
+//! - 13.0-13.4
 //!
 //! CUDNN versions supported:
 //! - 9.12.0
@@ -128,7 +128,11 @@ extern crate no_std_compat as std;
 pub mod cublas;
 #[cfg(feature = "cublaslt")]
 pub mod cublaslt;
-#[cfg(feature = "cudnn")]
+#[cfg(any(
+    feature = "cudnn-08009",
+    feature = "cudnn-09010",
+    feature = "cudnn-09021",
+))]
 pub mod cudnn;
 #[cfg(all(
     feature = "cufft",
@@ -154,7 +158,12 @@ pub mod cusolvermg;
 #[cfg(feature = "cusparse")]
 pub mod cusparse;
 #[cfg(all(
-    feature = "cutensor",
+    any(
+        feature = "cutensor-02003",
+        feature = "cutensor-02004",
+        feature = "cutensor-02005",
+        feature = "cutensor-02006",
+    ),
     not(any(
         feature = "cuda-11040",
         feature = "cuda-11050",
@@ -166,7 +175,16 @@ pub mod cusparse;
 pub mod cutensor;
 #[cfg(feature = "driver")]
 pub mod driver;
-#[cfg(feature = "nccl")]
+#[cfg(any(
+    feature = "nccl-02022",
+    feature = "nccl-02024",
+    feature = "nccl-02025",
+    feature = "nccl-02026",
+    feature = "nccl-02027",
+    feature = "nccl-02028",
+    feature = "nccl-02029",
+    feature = "nccl-02030",
+))]
 pub mod nccl;
 #[cfg(feature = "nvrtc")]
 pub mod nvrtc;
@@ -183,7 +201,7 @@ pub(crate) fn panic_no_lib_found<S: std::fmt::Debug>(lib_name: &str, choices: &[
 }
 
 #[cfg(feature = "dynamic-loading")]
-pub(crate) fn get_lib_name_candidates(lib_name: &str) -> std::vec::Vec<std::string::String> {
+pub fn get_lib_name_candidates(lib_name: &str) -> std::vec::Vec<std::string::String> {
     use std::env::consts::{DLL_PREFIX, DLL_SUFFIX};
 
     let pointer_width = if cfg!(target_pointer_width = "32") {

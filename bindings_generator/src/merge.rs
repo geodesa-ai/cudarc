@@ -1,141 +1,84 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use proc_macro2::TokenStream;
 use quote::{ToTokens, quote};
+use rayon::prelude::*;
 use std::collections::BTreeMap;
 use std::fs;
+use std::ops::Deref;
 use std::path::Path;
-use syn::parse::Parser;
+use std::process::Command;
 use syn::{
-    Expr, Field, FnArg, ForeignItemFn, Item, ItemConst, ItemEnum, ItemFn, ItemImpl, ItemStruct,
-    ItemType, ItemUnion, ItemUse, Pat, Stmt,
+    FnArg, ForeignItemFn, Item, ItemConst, ItemEnum, ItemImpl, ItemStruct, ItemType, ItemUnion,
+    ItemUse, Pat,
 };
 
 use crate::ModuleConfig;
+use crate::version::Version;
 
-#[derive(Debug, Ord, PartialEq, PartialOrd, Eq, Clone, Copy)]
-struct Version {
-    pub major: u32,
-    pub minor: u32,
-    pub patch: u32,
-}
-
-impl std::fmt::Display for Version {
-    // This trait requires `fmt` with this exact signature.
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        // Write strictly the first element into the supplied output
-        // stream: `f`. Returns `fmt::Result` which indicates whether the
-        // operation succeeded or failed. Note that `write!` uses syntax which
-        // is very similar to `log::debug!`.
-        write!(f, "{}.{}.{}", self.major, self.minor, self.patch)
-    }
-}
-
-struct LibItem {
-    adapter_function: ItemFn,
-    member: Field,
-    init_member: Stmt,
-    init_decl: Expr,
-}
-struct LibItems {
-    adapter_functions: Vec<ItemFn>,
-    members: Vec<Field>,
-    init_members: Vec<Stmt>,
-    init_fields: Vec<Expr>,
-}
-impl LibItem {
-    fn new(func: &ForeignItemFn, versions: &[&Version], n_versions: usize) -> Self {
-        let parser = Field::parse_named;
-        let features = versions
-            .iter()
-            .map(|v| version_to_feature(v))
-            .collect::<Vec<_>>();
-        let feature_tok = if versions.len() == n_versions {
-            quote! {}
-        } else {
-            quote! {
-                #[cfg(any(#(feature=#features),*))]
-            }
-        };
-        let ForeignItemFn {
-            attrs: _,
-            vis: _,
-            sig,
-            semi_token: _,
-        } = func;
-        let fn_name = &sig.ident;
-        let inputs = &func.sig.inputs;
-        let output = &func.sig.output;
-        // Extract only argument names (without types)
-        let arg_names = inputs.iter().filter_map(|arg| {
-            if let FnArg::Typed(pat_type) = arg {
-                if let Pat::Ident(pat_ident) = *pat_type.pat.clone() {
-                    return Some(pat_ident.ident.clone());
-                }
+/// Build a unified adapter for a single foreign function.
+///
+/// The emitted adapter has both link strategies inside its body, gated on the
+/// `dynamic-loading` feature: a per-symbol `OnceLock` that resolves the symbol
+/// on first call when dynamic loading is enabled, or a plain `extern "C"` decl
+/// + call when it's not. The outer `pub unsafe fn` and its signature are the
+/// same in both modes, so callers don't see a difference.
+fn build_adapter(
+    func: &ForeignItemFn,
+    versions: &[&Version],
+    n_versions: usize,
+    feature_prefix: &str,
+) -> TokenStream {
+    let features = versions
+        .iter()
+        .map(|v| v.feature_name(feature_prefix))
+        .collect::<Vec<_>>();
+    let feature_tok = if versions.len() == n_versions {
+        quote! {}
+    } else {
+        quote! {
+            #[cfg(any(#(feature=#features),*))]
+        }
+    };
+    let sig = &func.sig;
+    let fn_name = &sig.ident;
+    let inputs = &sig.inputs;
+    let output = &sig.output;
+    let (arg_names, arg_types): (Vec<_>, Vec<_>) = inputs
+        .iter()
+        .filter_map(|arg| {
+            if let FnArg::Typed(pat_type) = arg
+                && let Pat::Ident(pat_ident) = pat_type.pat.deref()
+            {
+                return Some((pat_ident.ident.clone(), pat_type.ty.clone()));
             }
             None
-        });
-
-        let args = arg_names;
-        let c = quote! {
-            #feature_tok
-            pub unsafe fn #fn_name(#inputs) #output{
-                (culib().#fn_name)(#(#args),*)
-            }
-        };
-        let adapter_function: ItemFn = syn::parse2(c.clone()).unwrap();
-        let symbol_cstr = cstr_expr(fn_name.to_string());
-        let init_member = syn::parse2(quote! {
-            #feature_tok
-            let #fn_name = __library
-                .get(#symbol_cstr)
-                .map(|sym| *sym).expect("Expected symbol in library");
         })
-        .unwrap();
-        let init_decl = syn::parse2(quote! {
-            #feature_tok
-            #fn_name
-        })
-        .unwrap();
-        let c = quote! {
-            #feature_tok
-            pub #fn_name: unsafe extern "C" fn(#inputs) #output
-        };
-        let member = parser.parse2(c).unwrap();
-        Self {
-            adapter_function,
-            init_member,
-            init_decl,
-            member,
-        }
-    }
-}
+        .unzip();
+    let symbol_str = fn_name.to_string();
 
-pub fn cstr_expr(mut string: String) -> TokenStream {
-    string.push('\0');
-    let b = proc_macro2::Literal::byte_string(string.as_bytes());
     quote! {
-        #b
-    }
-}
-
-impl From<Vec<LibItem>> for LibItems {
-    fn from(value: Vec<LibItem>) -> Self {
-        let (adapter_functions, members, init_members, init_fields) = value
-            .into_iter()
-            .map(|v| (v.adapter_function, v.member, v.init_member, v.init_decl))
-            .collect();
-        Self {
-            adapter_functions,
-            members,
-            init_members,
-            init_fields,
+        #feature_tok
+        pub unsafe fn #fn_name(#inputs) #output {
+            #[cfg(feature = "dynamic-loading")]
+            {
+                type _F = unsafe extern "C" fn(#(#arg_types),*) #output;
+                static _S: OnceLock<_F> = OnceLock::new();
+                let _f = _S.get_or_init(|| unsafe { load::<_F>(#symbol_str) });
+                _f(#(#arg_names),*)
+            }
+            #[cfg(not(feature = "dynamic-loading"))]
+            {
+                extern "C" { fn #fn_name(#inputs) #output; }
+                #fn_name(#(#arg_names),*)
+            }
         }
     }
 }
 
 #[derive(Debug)]
 struct FunctionInfo<T> {
-    declarations: BTreeMap<Version, T>, // version -> declaration
+    declarations: BTreeMap<Version, T>,
 }
 
 impl<T> Default for FunctionInfo<T> {
@@ -148,7 +91,7 @@ impl<T> Default for FunctionInfo<T> {
 
 impl<T> FunctionInfo<T> {
     fn insert(&mut self, version: &Version, value: T) -> Option<T> {
-        self.declarations.insert(version.clone(), value)
+        self.declarations.insert(*version, value)
     }
 }
 
@@ -165,13 +108,15 @@ struct BindingMerger {
 
     lib_names: Vec<String>,
     n_versions: usize,
+    feature_prefix: String,
 }
 
 impl BindingMerger {
-    pub fn new(lib_names: Vec<String>) -> Self {
+    pub fn new(lib_names: Vec<String>, feature_prefix: String) -> Self {
         Self {
             lib_names,
             n_versions: 0,
+            feature_prefix,
             ..Default::default()
         }
     }
@@ -246,14 +191,11 @@ impl BindingMerger {
         let uses = self.write_to_output(&self.uses).expect("Write to output");
         let unions = self.write_to_output(&self.unions).expect("Write to output");
         let consts = self.write_to_output(&self.consts).expect("Write to output");
-        let functions = self
-            .write_to_output(&self.functions)
-            .expect("Write to output");
 
         let lib_names = &self.lib_names;
 
-        let loading_lib = self
-            .create_loading_lib(&self.functions)
+        let adapters = self
+            .create_unified_adapters(&self.functions)
             .expect("Write to output");
 
         TokenStream::from(quote! {
@@ -264,10 +206,17 @@ impl BindingMerger {
             #![allow(non_snake_case)]
             #![allow(dead_code)]
 
+            use std::sync::OnceLock;
+
             #[cfg(feature = "no-std")]
             extern crate alloc;
             #[cfg(feature = "no-std")]
             extern crate no_std_compat as std;
+
+            #[cfg(feature = "dynamic-loading")]
+            fn load<F: Copy>(name: &str) -> F {
+                unsafe { *culib().get::<F>(name.as_bytes()).unwrap_or_else(|e| panic!("Missing symbol {name}: {e}")) }
+            }
 
             #uses
 
@@ -283,48 +232,41 @@ impl BindingMerger {
 
             #unions
 
-            #[cfg(not(feature="dynamic-loading"))]
-            extern "C" {
-                #functions
+            #adapters
+
+            #[cfg(feature = "dynamic-loading")]
+            pub unsafe fn is_culib_present() -> bool {
+                let lib_names = [#(#lib_names),*];
+                let choices = lib_names
+                    .iter()
+                    .map(|l| crate::get_lib_name_candidates(l))
+                    .flatten();
+                for choice in choices {
+                    if ::libloading::Library::new(choice).is_ok() {
+                        return true;
+                    }
+                }
+                false
             }
 
-            #[cfg(feature="dynamic-loading")]
-            mod loaded{
-               use super::*;
-
-               #loading_lib
-
-               pub unsafe fn is_culib_present() -> bool {
-                   let lib_names = [#(#lib_names),*];
-                   let choices = lib_names
-                       .iter()
-                       .map(|l| crate::get_lib_name_candidates(l))
-                       .flatten();
-                   for choice in choices {
-                       if Lib::new(choice).is_ok() {
-                           return true;
-                       }
-                   }
-                   false
-               }
-
-               pub unsafe fn culib() -> &'static Lib {
-                   static LIB: std::sync::OnceLock<Lib> = std::sync::OnceLock::new();
-                   LIB.get_or_init(|| {
-                       let lib_names = std::vec![#(#lib_names),*];
-                       let choices: std::vec::Vec<_> = lib_names.iter().map(|l| crate::get_lib_name_candidates(l)).flatten().collect();
-                       for choice in choices.iter() {
-                           if let Ok(lib) = Lib::new(choice) {
-                               return lib;
-                           }
-                       }
-                       crate::panic_no_lib_found(lib_names[0], &choices);
-                   })
-               }
-
+            #[cfg(feature = "dynamic-loading")]
+            pub unsafe fn culib() -> &'static ::libloading::Library {
+                static LIB: OnceLock<::libloading::Library> = OnceLock::new();
+                LIB.get_or_init(|| {
+                    let lib_names = std::vec![#(#lib_names),*];
+                    let choices: std::vec::Vec<_> = lib_names
+                        .iter()
+                        .map(|l| crate::get_lib_name_candidates(l))
+                        .flatten()
+                        .collect();
+                    for choice in choices.iter() {
+                        if let Ok(lib) = ::libloading::Library::new(choice) {
+                            return lib;
+                        }
+                    }
+                    crate::panic_no_lib_found(lib_names[0], &choices);
+                })
             }
-            #[cfg(feature="dynamic-loading")]
-            pub use loaded::*;
         })
     }
 
@@ -334,39 +276,36 @@ impl BindingMerger {
     ) -> Result<TokenStream> {
         let mut output = TokenStream::new();
         for (name, info) in info {
-            // Function with version-specific declarations
             let mut prev_decl: Option<&T> = None;
-            let mut versions = vec![];
+            let mut versions: Vec<Version> = vec![];
             for (version, decl) in &info.declarations {
-                if let Some(prev_decl) = prev_decl {
-                    if prev_decl != decl {
-                        if !versions.is_empty() {
-                            log::debug!("Breaking change detected in {version} for {name}");
-                        }
-                        let features = versions
-                            .iter()
-                            .map(|v| version_to_feature(v))
-                            .collect::<Vec<_>>();
-                        output.extend(quote! {
-                            #[cfg(any(#(feature = #features), *))]
-                            #prev_decl
-                        });
-                        versions.clear();
+                if let Some(prev_decl) = prev_decl
+                    && prev_decl != decl
+                {
+                    if !versions.is_empty() {
+                        log::debug!("Breaking change detected in {version} for {name}");
                     }
+                    let features = versions
+                        .iter()
+                        .map(|v| v.feature_name(&self.feature_prefix))
+                        .collect::<Vec<_>>();
+                    output.extend(quote! {
+                        #[cfg(any(#(feature = #features), *))]
+                        #prev_decl
+                    });
+                    versions.clear();
                 }
                 versions.push(*version);
-                prev_decl = Some(decl.into());
+                prev_decl = Some(decl);
             }
             if !versions.is_empty() {
                 if let Some(decl) = prev_decl {
                     if versions.len() == self.n_versions {
-                        // XXX small nicety, if every single version implements
-                        // a function, just remove the feature flags.
                         output.extend(decl.into_token_stream());
                     } else {
                         let features = versions
                             .iter()
-                            .map(|v| version_to_feature(v))
+                            .map(|v| v.feature_name(&self.feature_prefix))
                             .collect::<Vec<_>>();
                         output.extend(quote! {
                             #[cfg(any(#(feature = #features),*))]
@@ -383,144 +322,102 @@ impl BindingMerger {
         Ok(output)
     }
 
-    fn create_loading_lib(
+    fn create_unified_adapters(
         &self,
         info: &BTreeMap<String, FunctionInfo<ForeignItemFn>>,
     ) -> Result<TokenStream> {
-        let mut elements = vec![];
-        for (_name, info) in info {
-            // Function with version-specific declarations
+        let mut adapters: Vec<TokenStream> = vec![];
+        for info in info.values() {
             let mut prev_decl: Option<&ForeignItemFn> = None;
             let mut versions = vec![];
             for (version, decl) in &info.declarations {
-                if let Some(prev_decl) = prev_decl {
-                    if prev_decl != decl {
-                        let element = LibItem::new(prev_decl, &versions, self.n_versions);
-                        elements.push(element);
-                        versions.clear();
-                    }
+                if let Some(prev_decl) = prev_decl
+                    && prev_decl != decl
+                {
+                    adapters.push(build_adapter(
+                        prev_decl,
+                        &versions,
+                        self.n_versions,
+                        &self.feature_prefix,
+                    ));
+                    versions.clear();
                 }
                 versions.push(version);
-                prev_decl = Some(decl.into());
+                prev_decl = Some(decl);
             }
-            if !versions.is_empty() {
-                if let Some(decl) = prev_decl {
-                    let element = LibItem::new(decl, &versions, self.n_versions);
-                    elements.push(element);
-                }
+            if !versions.is_empty()
+                && let Some(decl) = prev_decl
+            {
+                adapters.push(build_adapter(
+                    decl,
+                    &versions,
+                    self.n_versions,
+                    &self.feature_prefix,
+                ));
             }
         }
 
-        let LibItems {
-            adapter_functions,
-            members,
-            init_members,
-            init_fields,
-        } = elements.into();
         Ok(quote! {
-            #(#adapter_functions)
-            *
-
-            pub struct Lib{
-                __library: ::libloading::Library,
-                #(#members),
-                *
-            }
-
-            impl Lib{
-                pub unsafe fn new<P>(path: P) -> Result<Self, ::libloading::Error>
-                where
-                    P: AsRef<::std::ffi::OsStr>,
-                {
-                    let library = ::libloading::Library::new(path.as_ref())?;
-                    Self::from_library(library)
-                }
-                pub unsafe fn from_library<L>(library: L) -> Result<Self, ::libloading::Error>
-                where
-                    L: Into<::libloading::Library>,
-                {
-                    let __library = library.into();
-                    #(#init_members);
-                    *
-                    Ok(Self{
-                        __library,
-                        #(#init_fields), *
-                    })
-                }
-
-            }
-
+            #(#adapters)*
         })
     }
-}
-
-fn version_to_feature(version: &Version) -> String {
-    format!(
-        "cuda-{:0>2}{:0>2}{}",
-        version.major, version.minor, version.patch
-    )
 }
 
 pub fn merge<P: AsRef<Path>>(
     binding_dir: P,
     output_filename: P,
     lib_names: Vec<String>,
+    feature_prefix: &str,
 ) -> Result<()> {
     let binding_dir = binding_dir.as_ref();
-    let mut merger = BindingMerger::new(lib_names);
+    let entries: Vec<_> = fs::read_dir(binding_dir)?.collect::<std::io::Result<_>>()?;
 
-    let entries = fs::read_dir(binding_dir)?;
+    let mut merger = BindingMerger::new(lib_names, feature_prefix.to_string());
     for entry in entries {
-        let entry = entry?;
         let path = entry.path();
         if path.is_file() {
-            if let Ok(version) = extract_version_from_filename(&path.display().to_string()) {
-                merger.process_file(&path, &version)?;
-            }
+            let version = parse_version_from_filename(&path)?;
+            merger.process_file(&path, &version)?;
         }
     }
 
-    // Generate unified output
-    let unified = merger.generate_unified_bindings();
-    let parsed = syn::parse2(unified.clone())
-        .with_context(|| format!("In module {:?}", binding_dir.display()))?;
-    std::fs::write(&output_filename, prettyplease::unparse(&parsed))?;
+    let tokens = merger.generate_unified_bindings();
+    std::fs::write(&output_filename, tokens.to_string())?;
+    Command::new("rustfmt")
+        .arg("--config-path")
+        .arg("bindings-fmt.toml")
+        .arg(output_filename.as_ref())
+        .status()
+        .unwrap();
     Ok(())
 }
 
-fn extract_version_from_filename(cuda_version: &str) -> Result<Version> {
-    let number = cuda_version
-        .split('_')
-        .last()
-        .context(format!("Invalid CUDA version format: {}", cuda_version))?;
-
-    let major = number[..2].parse().context(format!(
-        "Failed to parse major version from {}",
-        cuda_version
-    ))?;
-    let minor = number[2..4].parse().context(format!(
-        "Failed to parse minor version from {}",
-        cuda_version
-    ))?;
-    let patch = number[4..5].parse().context(format!(
-        "Failed to parse patch version from {}",
-        cuda_version
-    ))?;
-
-    Ok(Version {
-        major,
-        minor,
-        patch,
-    })
+fn parse_version_from_filename(path: &Path) -> Result<Version> {
+    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap();
+    let version_str = stem.strip_prefix("sys_").unwrap();
+    version_str.parse()
 }
 
 pub fn merge_bindings(modules: &[ModuleConfig]) -> Result<()> {
-    for config in modules {
-        merge(
-            format!("out/{}/sys/linked", config.cudarc_name),
-            format!("../src/{}/sys/mod.rs", config.cudarc_name),
-            config.libs.iter().map(|&s| s.into()).collect(),
-        )?;
-    }
+    let multi_progress = MultiProgress::new();
+
+    let pb = multi_progress.add(ProgressBar::new(modules.len() as u64));
+    pb.set_style(ProgressStyle::default_bar().template("merge {bar} {pos}/{len}")?);
+
+    modules
+        .into_par_iter()
+        .map(|config| {
+            merge(
+                format!("out/{}/sys/linked", config.cudarc_name),
+                format!("../src/{}/sys/mod.rs", config.cudarc_name),
+                config.libs.iter().map(|&s| s.into()).collect(),
+                config.feature_prefix,
+            )?;
+            pb.inc(1);
+            Ok(())
+        })
+        .collect::<Result<Vec<_>>>()?;
+    pb.finish();
+
     Ok(())
 }

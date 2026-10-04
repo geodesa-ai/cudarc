@@ -168,13 +168,64 @@ pub mod device {
         let id: sys::CUuuid;
         unsafe {
             let mut uuid = MaybeUninit::uninit();
-            #[cfg(not(any(feature = "cuda-13000", feature = "cuda-13010")))]
+            #[cfg(not(any(
+                feature = "cuda-13000",
+                feature = "cuda-13010",
+                feature = "cuda-13020",
+                feature = "cuda-13030",
+                feature = "cuda-13040"
+            )))]
             sys::cuDeviceGetUuid(uuid.as_mut_ptr(), dev).result()?;
-            #[cfg(any(feature = "cuda-13000", feature = "cuda-13010"))]
+            #[cfg(any(
+                feature = "cuda-13000",
+                feature = "cuda-13010",
+                feature = "cuda-13020",
+                feature = "cuda-13030",
+                feature = "cuda-13040"
+            ))]
             sys::cuDeviceGetUuid_v2(uuid.as_mut_ptr(), dev).result()?;
             id = uuid.assume_init();
         }
         Ok(id)
+    }
+
+    /// Get the default memory pool for a device.
+    ///
+    /// See [cuda docs](https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__DEVICE.html#group__CUDA__DEVICE_1g2170a6e24f7e596854f0c48e1e98120e)
+    ///
+    /// # Safety
+    /// Must be a device returned from [get].
+    pub unsafe fn get_default_mem_pool(
+        dev: sys::CUdevice,
+    ) -> Result<sys::CUmemoryPool, DriverError> {
+        let mut pool = MaybeUninit::uninit();
+        sys::cuDeviceGetDefaultMemPool(pool.as_mut_ptr(), dev).result()?;
+        Ok(pool.assume_init())
+    }
+
+    /// Get the current memory pool for a device.
+    ///
+    /// See [cuda docs](https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__DEVICE.html#group__CUDA__DEVICE_1gccf6a0d72cf1cf1b1e0c127f053e9cb5)
+    ///
+    /// # Safety
+    /// Must be a device returned from [get].
+    pub unsafe fn get_mem_pool(dev: sys::CUdevice) -> Result<sys::CUmemoryPool, DriverError> {
+        let mut pool = MaybeUninit::uninit();
+        sys::cuDeviceGetMemPool(pool.as_mut_ptr(), dev).result()?;
+        Ok(pool.assume_init())
+    }
+
+    /// Set the memory pool for a device.
+    ///
+    /// See [cuda docs](https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__DEVICE.html#group__CUDA__DEVICE_1g79369dcf089d772d11b5c3ccb05e7c21)
+    ///
+    /// # Safety
+    /// Must be a device returned from [get]. Pool must be valid.
+    pub unsafe fn set_mem_pool(
+        dev: sys::CUdevice,
+        pool: sys::CUmemoryPool,
+    ) -> Result<(), DriverError> {
+        sys::cuDeviceSetMemPool(dev, pool).result()
     }
 }
 
@@ -432,6 +483,65 @@ pub mod ctx {
     };
     use std::mem::MaybeUninit;
 
+    /// Creates a new non-primary CUDA context using `cuCtxCreate_v3`.
+    ///
+    /// Available on CUDA 11.04 through 12.090.
+    ///
+    /// # Safety
+    ///
+    /// `dev` must be a valid device returned from [`super::device::get`].
+    #[cfg(any(
+        feature = "cuda-11040",
+        feature = "cuda-11050",
+        feature = "cuda-11060",
+        feature = "cuda-11070",
+        feature = "cuda-11080",
+        feature = "cuda-12000",
+        feature = "cuda-12010",
+        feature = "cuda-12020",
+        feature = "cuda-12030",
+        feature = "cuda-12040",
+        feature = "cuda-12050",
+        feature = "cuda-12060",
+        feature = "cuda-12080",
+        feature = "cuda-12090"
+    ))]
+    pub unsafe fn create_v3(
+        flags: ::core::ffi::c_uint,
+        dev: sys::CUdevice,
+    ) -> Result<sys::CUcontext, DriverError> {
+        let mut ctx = MaybeUninit::uninit();
+        sys::cuCtxCreate_v3(ctx.as_mut_ptr(), std::ptr::null_mut(), 0, flags, dev).result()?;
+        Ok(ctx.assume_init())
+    }
+
+    /// Creates a new non-primary CUDA context using `cuCtxCreate_v4`.
+    ///
+    /// Available on CUDA 12.050+. Supports CiG (CUDA in Graphics) parameters
+    /// via `ctxCreateParams`.
+    ///
+    /// # Safety
+    ///
+    /// - `dev` must be a valid device returned from [`super::device::get`].
+    /// - If `ctx_create_params` is not null, it must point to a valid `CUctxCreateParams`.
+    #[cfg(any(
+        feature = "cuda-12050",
+        feature = "cuda-12060",
+        feature = "cuda-12080",
+        feature = "cuda-12090",
+        feature = "cuda-13000",
+        feature = "cuda-13010"
+    ))]
+    pub unsafe fn create_v4(
+        ctx_create_params: *mut sys::CUctxCreateParams,
+        flags: ::core::ffi::c_uint,
+        dev: sys::CUdevice,
+    ) -> Result<sys::CUcontext, DriverError> {
+        let mut ctx = MaybeUninit::uninit();
+        sys::cuCtxCreate_v4(ctx.as_mut_ptr(), ctx_create_params, flags, dev).result()?;
+        Ok(ctx.assume_init())
+    }
+
     /// Binds the specified CUDA context to the calling CPU thread.
     ///
     /// See [cuda docs](https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__CTX.html#group__CUDA__CTX_1gbe562ee6258b4fcc272ca6478ca2a2f7)
@@ -567,6 +677,44 @@ pub mod stream {
         unsafe {
             sys::cuStreamCreate(stream.as_mut_ptr(), kind.flags() as u32).result()?;
             Ok(stream.assume_init())
+        }
+    }
+
+    /// Creates a stream with the specified kind and priority.
+    ///
+    /// Lower numerical values indicate higher priority. Use [`get_priority_range`]
+    /// to query the valid range for the current context.
+    ///
+    /// See [cuda docs](https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__STREAM.html#group__CUDA__STREAM_1g95c1a8c7c3dacb13091692dd9c7f7471)
+    pub fn create_with_priority(
+        kind: StreamKind,
+        priority: i32,
+    ) -> Result<sys::CUstream, DriverError> {
+        let mut stream = MaybeUninit::uninit();
+        unsafe {
+            sys::cuStreamCreateWithPriority(stream.as_mut_ptr(), kind.flags() as u32, priority)
+                .result()?;
+            Ok(stream.assume_init())
+        }
+    }
+
+    /// Queries the range of stream priorities for the current context.
+    ///
+    /// Returns `(least_priority, greatest_priority)` matching the CUDA driver
+    /// API parameter order. Note that in CUDA, numerically **smaller** values
+    /// mean **higher** priority, so `greatest_priority <= least_priority`.
+    /// For example, a return value of `(0, -5)` means priority -5 is the
+    /// highest and 0 is the lowest.
+    ///
+    /// If the device does not support stream priorities, both values will be 0.
+    ///
+    /// See [cuda docs](https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__CTX.html#group__CUDA__CTX_1g137920ab61a71be6ce67f32ba4f72354)
+    pub fn get_priority_range() -> Result<(i32, i32), DriverError> {
+        let mut least = MaybeUninit::uninit();
+        let mut greatest = MaybeUninit::uninit();
+        unsafe {
+            sys::cuCtxGetStreamPriorityRange(least.as_mut_ptr(), greatest.as_mut_ptr()).result()?;
+            Ok((least.assume_init(), greatest.assume_init()))
         }
     }
 
@@ -1147,9 +1295,21 @@ pub mod event {
     pub unsafe fn elapsed(start: sys::CUevent, end: sys::CUevent) -> Result<f32, DriverError> {
         let mut ms: f32 = 0.0;
         unsafe {
-            #[cfg(not(any(feature = "cuda-13000", feature = "cuda-13010")))]
+            #[cfg(not(any(
+                feature = "cuda-13000",
+                feature = "cuda-13010",
+                feature = "cuda-13020",
+                feature = "cuda-13030",
+                feature = "cuda-13040"
+            )))]
             sys::cuEventElapsedTime((&mut ms) as *mut _, start, end).result()?;
-            #[cfg(any(feature = "cuda-13000", feature = "cuda-13010"))]
+            #[cfg(any(
+                feature = "cuda-13000",
+                feature = "cuda-13010",
+                feature = "cuda-13020",
+                feature = "cuda-13030",
+                feature = "cuda-13040"
+            ))]
             sys::cuEventElapsedTime_v2((&mut ms) as *mut _, start, end).result()?;
         }
         Ok(ms)
@@ -1378,6 +1538,9 @@ pub mod graph {
     use std::{vec, vec::Vec};
 
     /// See [cuda docs](https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__GRAPH.html#group__CUDA__GRAPH_1gb53b435e178cccfa37ac87285d2c3fa1)
+    ///
+    /// Pass `sys::CUgraphInstantiate_flags(0)` for default behavior, or combine flags with `|`.
+    ///
     /// # Safety
     /// graph must be valid
     pub unsafe fn instantiate(
@@ -1385,7 +1548,7 @@ pub mod graph {
         flags: sys::CUgraphInstantiate_flags,
     ) -> Result<sys::CUgraphExec, DriverError> {
         let mut graph_exec = MaybeUninit::uninit();
-        sys::cuGraphInstantiateWithFlags(graph_exec.as_mut_ptr(), graph, flags as u32 as u64)
+        sys::cuGraphInstantiateWithFlags(graph_exec.as_mut_ptr(), graph, u64::from(flags.0))
             .result()?;
         Ok(graph_exec.assume_init())
     }
@@ -1868,9 +2031,30 @@ pub mod mem_pool {
         props.allocType = sys::CUmemAllocationType::CU_MEM_ALLOCATION_TYPE_PINNED;
         props.handleTypes = sys::CUmemAllocationHandleType::CU_MEM_HANDLE_TYPE_NONE;
         props.location.type_ = sys::CUmemLocationType::CU_MEM_LOCATION_TYPE_DEVICE;
-        props.location.id = ordinal;
+        #[cfg(any(feature = "cuda-13020", feature = "cuda-13030", feature = "cuda-13040"))]
+        {
+            props.location.__bindgen_anon_1.id = ordinal;
+        }
+        #[cfg(not(any(feature = "cuda-13020", feature = "cuda-13030", feature = "cuda-13040")))]
+        {
+            props.location.id = ordinal;
+        }
 
         sys::cuMemPoolCreate(pool.as_mut_ptr(), &props).result()?;
+        Ok(pool.assume_init())
+    }
+
+    /// Create a memory pool.
+    ///
+    /// See [cuda docs](https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__MALLOC__ASYNC.html#group__CUDA__MALLOC__ASYNC_1g8aa7ef8b06b0df48350794e1e8bba704)
+    ///
+    /// # Safety
+    /// `pool_props` must point to a valid [sys::CUmemPoolProps].
+    pub unsafe fn create_with_props(
+        pool_props: *const sys::CUmemPoolProps,
+    ) -> Result<sys::CUmemoryPool, DriverError> {
+        let mut pool = MaybeUninit::uninit();
+        sys::cuMemPoolCreate(pool.as_mut_ptr(), pool_props).result()?;
         Ok(pool.assume_init())
     }
 
@@ -1943,6 +2127,49 @@ pub mod mem_pool {
         Ok(dev_ptr.assume_init())
     }
 
+    /// Release unused memory back to the OS.
+    ///
+    /// See [cuda docs](https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__MALLOC__ASYNC.html#group__CUDA__MALLOC__ASYNC_1g6b3f1ea779bda578c8e26101caa3d958)
+    ///
+    /// # Safety
+    /// Pool must be valid.
+    pub unsafe fn trim_to(
+        pool: sys::CUmemoryPool,
+        min_bytes_to_keep: usize,
+    ) -> Result<(), DriverError> {
+        sys::cuMemPoolTrimTo(pool, min_bytes_to_keep).result()
+    }
+
+    /// Get a pool attribute.
+    ///
+    /// See [cuda docs](https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__MALLOC__ASYNC.html#group__CUDA__MALLOC__ASYNC_1gdc3766ee0671e498e6ba03de08e00e5c)
+    ///
+    /// # Safety
+    /// Pool must be valid. `value` must point to memory of the correct
+    /// type for the given attribute.
+    pub unsafe fn get_attribute_raw(
+        pool: sys::CUmemoryPool,
+        attr: sys::CUmemPool_attribute,
+        value: *mut core::ffi::c_void,
+    ) -> Result<(), DriverError> {
+        sys::cuMemPoolGetAttribute(pool, attr, value).result()
+    }
+
+    /// Set a pool attribute.
+    ///
+    /// See [cuda docs](https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__MALLOC__ASYNC.html#group__CUDA__MALLOC__ASYNC_1g1ef006cd08dbf0ec5e4cb93bf7b044dc)
+    ///
+    /// # Safety
+    /// Pool must be valid. `value` must point to memory of the correct
+    /// type for the given attribute.
+    pub unsafe fn set_attribute_raw(
+        pool: sys::CUmemoryPool,
+        attr: sys::CUmemPool_attribute,
+        value: *mut core::ffi::c_void,
+    ) -> Result<(), DriverError> {
+        sys::cuMemPoolSetAttribute(pool, attr, value).result()
+    }
+
     /// Get the default memory pool for a device.
     ///
     /// See [cuda docs](https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__DEVICE.html#group__CUDA__DEVICE_1g26aa5b41f58e5cb8f9e5e9b1a3e8e8e8)
@@ -1985,15 +2212,11 @@ pub mod mem_pool {
 mod tests {
     use super::super::safe::{CudaContext, CudaSlice};
     use super::*;
-    use std::println;
 
     #[test]
+    #[ignore = "must be executed with multiple gpus"]
     fn peer_transfer_contexts() -> Result<(), DriverError> {
         let ctx1 = CudaContext::new(0)?;
-        if device::get_count()? < 2 {
-            println!("Skip test because not enough cuda devices");
-            return Ok(());
-        }
         let stream1 = ctx1.default_stream();
         let a: CudaSlice<f64> = stream1.alloc_zeros::<f64>(10)?;
 
@@ -2020,12 +2243,9 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "must be executed with multiple gpus"]
     fn re_associate_context_for_memory_op() -> Result<(), DriverError> {
         let ctx1 = CudaContext::new(0)?;
-        if device::get_count()? < 2 {
-            println!("Skip test because not enough cuda devices");
-            return Ok(());
-        }
         let stream1 = ctx1.default_stream();
         let a: CudaSlice<f64> = stream1.alloc_zeros::<f64>(10)?;
 

@@ -3,10 +3,22 @@
 use super::{result, result::CublasError, sys};
 use crate::cublaslt::result::set_matrix_layout_attribute;
 use crate::driver::sys::{CUdevice_attribute, CUdeviceptr};
+#[cfg(any(
+    feature = "cuda-12080",
+    feature = "cuda-12090",
+    feature = "cuda-13000",
+    feature = "cuda-13010",
+    feature = "cuda-13020",
+    feature = "cuda-13030",
+    feature = "cuda-13040",
+))]
+use crate::driver::DeviceRepr;
 use crate::driver::{CudaSlice, CudaStream, DevicePtr, DevicePtrMut, DriverError, TryClone};
 use core::ffi::c_int;
+use core::marker::PhantomData;
 use core::mem;
 use std::sync::Arc;
+use std::vec::Vec;
 
 /// Wrapper around [sys::cublasLtHandle_t]
 ///
@@ -74,6 +86,66 @@ impl Drop for CudaBlasLT {
         if !handle.is_null() {
             unsafe { result::destroy_handle(handle) }.unwrap();
         }
+    }
+}
+
+impl CudaBlasLT {
+    /// Prepare a matmul operation with the given configuration.
+    ///
+    /// Sets up matrix layouts, matmul descriptor, and transpose settings.
+    /// Epilogue (bias/activation) is deferred to [`MatmulOperation::launch()`] so that
+    /// the bias buffer's `SyncOnDrop` guard lives through the actual matmul execution.
+    pub fn matmul_op<T>(&self, cfg: &MatmulConfig) -> Result<MatmulOperation<'_, T>, CublasError>
+    where
+        Self: Matmul<T>,
+    {
+        let compute_type = <Self as Matmul<T>>::compute_type();
+        let matrix_type = <Self as Matmul<T>>::matrix_type();
+        let scale_type = sys::cudaDataType_t::CUDA_R_32F;
+
+        let (a_rows, a_cols) = if cfg.transa {
+            (cfg.k, cfg.m)
+        } else {
+            (cfg.m, cfg.k)
+        };
+        let (b_rows, b_cols) = if cfg.transb {
+            (cfg.n, cfg.k)
+        } else {
+            (cfg.k, cfg.n)
+        };
+
+        let a_layout = MatrixLayout::new(matrix_type, a_rows, a_cols, cfg.lda)?;
+        if let (Some(batch_size), Some(stride_a)) = (cfg.batch_size, cfg.stride_a) {
+            a_layout.set_batch(batch_size, stride_a)?;
+        }
+
+        let b_layout = MatrixLayout::new(matrix_type, b_rows, b_cols, cfg.ldb)?;
+        if let (Some(batch_size), Some(stride_b)) = (cfg.batch_size, cfg.stride_b) {
+            b_layout.set_batch(batch_size, stride_b)?;
+        }
+
+        let c_layout = MatrixLayout::new(matrix_type, cfg.m, cfg.n, cfg.ldc)?;
+        if let (Some(batch_size), Some(stride_c)) = (cfg.batch_size, cfg.stride_c) {
+            c_layout.set_batch(batch_size, stride_c)?;
+        }
+
+        let matmul_desc = MatmulDesc::new(compute_type, scale_type)?;
+        matmul_desc.set_transpose(cfg.transa, Matrix::A)?;
+        matmul_desc.set_transpose(cfg.transb, Matrix::B)?;
+        matmul_desc.set_transpose(cfg.transc, Matrix::C)?;
+
+        Ok(MatmulOperation {
+            blas: self,
+            matmul_desc,
+            a_layout,
+            b_layout,
+            c_layout,
+            compute_type,
+            scale_type,
+            matrix_type,
+            stride_bias: cfg.stride_bias,
+            _marker: PhantomData,
+        })
     }
 }
 
@@ -275,6 +347,54 @@ impl MatmulDesc {
         }
         Ok(())
     }
+
+    #[cfg(any(
+        feature = "cuda-12080",
+        feature = "cuda-12090",
+        feature = "cuda-13000",
+        feature = "cuda-13010",
+        feature = "cuda-13020",
+        feature = "cuda-13030",
+        feature = "cuda-13040",
+    ))]
+    fn set_scale_mode(
+        &self,
+        attr: sys::cublasLtMatmulDescAttributes_t,
+        mode: sys::cublasLtMatmulMatrixScale_t,
+    ) -> Result<(), CublasError> {
+        unsafe {
+            result::set_matmul_desc_attribute(
+                self.handle,
+                attr,
+                (&mode) as *const _ as *const _,
+                mem::size_of::<sys::cublasLtMatmulMatrixScale_t>(),
+            )
+        }
+    }
+
+    #[cfg(any(
+        feature = "cuda-12080",
+        feature = "cuda-12090",
+        feature = "cuda-13000",
+        feature = "cuda-13010",
+        feature = "cuda-13020",
+        feature = "cuda-13030",
+        feature = "cuda-13040",
+    ))]
+    fn set_device_ptr_attribute(
+        &self,
+        attr: sys::cublasLtMatmulDescAttributes_t,
+        ptr: CUdeviceptr,
+    ) -> Result<(), CublasError> {
+        unsafe {
+            result::set_matmul_desc_attribute(
+                self.handle,
+                attr,
+                (&ptr) as *const CUdeviceptr as *const _,
+                mem::size_of::<CUdeviceptr>(),
+            )
+        }
+    }
 }
 
 impl Drop for MatmulDesc {
@@ -283,34 +403,256 @@ impl Drop for MatmulDesc {
     }
 }
 
-/// MatmulPref helper type
-struct MatmulPref {
-    handle: sys::cublasLtMatmulPreference_t,
+/// Matmul algorithm search preferences.
+///
+/// Controls how the heuristic algorithm search behaves.
+/// Create with [`MatmulPreference::new()`], configure, then pass to
+/// [`MatmulOperation::pick_algorithm()`] or [`MatmulOperation::pick_algorithms()`].
+#[derive(Debug)]
+pub struct MatmulPreference {
+    pub(crate) handle: sys::cublasLtMatmulPreference_t,
 }
 
-impl MatmulPref {
-    fn new() -> Result<Self, CublasError> {
+impl MatmulPreference {
+    /// Creates a new matmul preference descriptor with default settings.
+    pub fn new() -> Result<Self, CublasError> {
         let handle = result::create_matmul_pref()?;
         Ok(Self { handle })
     }
 
-    fn set_workspace_size(&self, size: usize) -> Result<(), CublasError> {
+    /// Set maximum workspace size the heuristic may assume (bytes).
+    ///
+    /// This is the key control for preventing the heuristic from selecting
+    /// algorithms that assume more workspace than is available, which can
+    /// cause incorrect results under memory pressure.
+    pub fn set_max_workspace_bytes(&self, size: u64) -> Result<(), CublasError> {
         unsafe {
-            // Set workspace size
             result::set_matmul_pref_attribute(
                 self.handle,
                 sys::cublasLtMatmulPreferenceAttributes_t::CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
                 (&size) as *const _ as *const _,
-                mem::size_of::<usize>(),
+                mem::size_of::<u64>(),
+            )
+        }
+    }
+
+    /// Get maximum workspace size setting (bytes).
+    pub fn max_workspace_bytes(&self) -> Result<u64, CublasError> {
+        let mut size: u64 = 0;
+        let mut size_written: usize = 0;
+        unsafe {
+            result::get_matmul_pref_attribute(
+                self.handle,
+                sys::cublasLtMatmulPreferenceAttributes_t::CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+                (&mut size) as *mut _ as *mut _,
+                mem::size_of::<u64>(),
+                &mut size_written,
             )?;
         }
-        Ok(())
+        Ok(size)
     }
 }
 
-impl Drop for MatmulPref {
+impl Drop for MatmulPreference {
     fn drop(&mut self) {
-        unsafe { result::destroy_matmul_pref(self.handle).expect("Unable to destroy matmul pref") }
+        let handle = mem::replace(&mut self.handle, std::ptr::null_mut());
+        if !handle.is_null() {
+            unsafe { result::destroy_matmul_pref(handle).expect("Unable to destroy matmul pref") }
+        }
+    }
+}
+
+/// A selected matmul algorithm.
+///
+/// Obtained from [`MatmulOperation::pick_algorithm()`],
+/// [`MatmulOperation::pick_algorithms()`], or [`MatmulOperation::algo_from_id()`].
+#[derive(Debug, Clone, Copy)]
+pub struct MatmulAlgorithm {
+    pub(crate) inner: sys::cublasLtMatmulAlgo_t,
+    /// Workspace bytes required by this algorithm.
+    pub workspace_size: usize,
+}
+
+impl MatmulAlgorithm {
+    fn from_sys(r: sys::cublasLtMatmulHeuristicResult_t) -> Self {
+        Self {
+            inner: r.algo,
+            workspace_size: r.workspaceSize,
+        }
+    }
+}
+
+/// A prepared matmul operation with all descriptors set up.
+///
+/// Follows the cuDNN ConvForward pattern:
+/// 1. Create via [`CudaBlasLT::matmul_op()`]
+/// 2. [`MatmulOperation::pick_algorithm()`] — heuristic selection
+/// 3. [`MatmulOperation::launch()`] — execute with chosen algorithm
+///
+/// Algorithm enumeration is also available via [`MatmulOperation::get_algo_ids()`]
+/// and [`MatmulOperation::algo_from_id()`].
+///
+/// Borrows the [`CudaBlasLT`] handle to prevent use-after-free.
+pub struct MatmulOperation<'a, T> {
+    blas: &'a CudaBlasLT,
+    matmul_desc: MatmulDesc,
+    a_layout: MatrixLayout,
+    b_layout: MatrixLayout,
+    c_layout: MatrixLayout,
+    compute_type: sys::cublasComputeType_t,
+    scale_type: sys::cudaDataType,
+    matrix_type: sys::cudaDataType,
+    stride_bias: Option<i64>,
+    _marker: PhantomData<T>,
+}
+
+impl<T> MatmulOperation<'_, T> {
+    /// Pick the best algorithm using heuristics.
+    ///
+    /// A `MatmulPreference` is always required (it is cheap to create via
+    /// `MatmulPreference::new()`). Call `set_max_workspace_bytes()` on it to constrain
+    /// workspace assumptions.
+    pub fn pick_algorithm(
+        &self,
+        preference: &MatmulPreference,
+    ) -> Result<MatmulAlgorithm, CublasError> {
+        let heuristic = unsafe {
+            result::get_matmul_algo_heuristic(
+                self.blas.handle,
+                self.matmul_desc.handle,
+                self.a_layout.handle,
+                self.b_layout.handle,
+                self.c_layout.handle,
+                self.c_layout.handle,
+                preference.handle,
+            )
+        }?;
+        Ok(MatmulAlgorithm::from_sys(heuristic))
+    }
+
+    /// Pick multiple algorithms ranked by estimated performance.
+    pub fn pick_algorithms(
+        &self,
+        preference: &MatmulPreference,
+        max_results: c_int,
+    ) -> Result<Vec<MatmulAlgorithm>, CublasError> {
+        let results = unsafe {
+            result::get_matmul_algo_heuristics(
+                self.blas.handle,
+                self.matmul_desc.handle,
+                self.a_layout.handle,
+                self.b_layout.handle,
+                self.c_layout.handle,
+                self.c_layout.handle,
+                preference.handle,
+                max_results,
+            )
+        }?;
+        Ok(results.into_iter().map(MatmulAlgorithm::from_sys).collect())
+    }
+
+    /// Get all compatible algorithm IDs for this operation's type combination.
+    pub fn get_algo_ids(&self, max_results: c_int) -> Result<Vec<c_int>, CublasError> {
+        unsafe {
+            result::get_matmul_algo_ids(
+                self.blas.handle,
+                self.compute_type,
+                self.scale_type,
+                self.matrix_type,
+                self.matrix_type,
+                self.matrix_type,
+                self.matrix_type,
+                max_results,
+            )
+        }
+    }
+
+    /// Initialize and validate an algorithm from a known ID.
+    ///
+    /// Combines initialization and validation in one step — returns a fully
+    /// validated `MatmulAlgorithm` with `workspace_size` populated, or an error
+    /// if the algorithm is incompatible with this operation's descriptors.
+    pub fn algo_from_id(&self, algo_id: c_int) -> Result<MatmulAlgorithm, CublasError> {
+        let inner = unsafe {
+            result::matmul_algo_init(
+                self.blas.handle,
+                self.compute_type,
+                self.scale_type,
+                self.matrix_type,
+                self.matrix_type,
+                self.matrix_type,
+                self.matrix_type,
+                algo_id,
+            )
+        }?;
+        let algo = MatmulAlgorithm {
+            inner,
+            workspace_size: 0,
+        };
+        let heuristic = unsafe {
+            result::matmul_algo_check(
+                self.blas.handle,
+                self.matmul_desc.handle,
+                self.a_layout.handle,
+                self.b_layout.handle,
+                self.c_layout.handle,
+                self.c_layout.handle,
+                &algo.inner as *const _,
+            )
+        }?;
+        Ok(MatmulAlgorithm::from_sys(heuristic))
+    }
+
+    /// Execute the matmul with an explicitly chosen algorithm and workspace.
+    ///
+    /// `alpha` and `beta` are `f32` because the current scale type is always `CUDA_R_32F`.
+    /// The workspace must have at least `algo.workspace_size` bytes available.
+    /// Bias and activation epilogue are set here (not at construction) so that the
+    /// bias buffer's `SyncOnDrop` guard lives through the matmul execution.
+    ///
+    /// # Safety
+    /// The a/b/c buffer sizes and types must match the MatmulConfig used to create
+    /// this operation.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn launch<I: DevicePtr<T>, O: DevicePtrMut<T>>(
+        &mut self,
+        algo: &MatmulAlgorithm,
+        workspace: &Workspace,
+        alpha: f32,
+        beta: f32,
+        a: &I,
+        b: &I,
+        c: &mut O,
+        bias: Option<&I>,
+        act: Option<&Activation>,
+    ) -> Result<(), CublasError> {
+        let stream = self.blas.stream();
+        let (bias_ptr, _record_bias) = bias.map(|b| b.device_ptr(stream)).unzip();
+        self.matmul_desc
+            .set_epilogue(act, bias_ptr.as_ref(), self.stride_bias)?;
+
+        let (a, _record_a) = a.device_ptr(stream);
+        let (b, _record_b) = b.device_ptr(stream);
+        let (c, _record_c) = c.device_ptr_mut(stream);
+        let (w, _record_w) = workspace.buffer.device_ptr(stream);
+        result::matmul(
+            self.blas.handle,
+            self.matmul_desc.handle,
+            (&alpha) as *const _ as *const _,
+            (&beta) as *const _ as *const _,
+            a as *const _,
+            self.a_layout.handle,
+            b as *const _,
+            self.b_layout.handle,
+            c as *const _,
+            self.c_layout.handle,
+            c as *mut _,
+            self.c_layout.handle,
+            (&algo.inner) as *const _,
+            w as *mut _,
+            workspace.size,
+            stream.cu_stream() as *mut _,
+        )
     }
 }
 
@@ -466,10 +808,10 @@ pub trait Matmul<T>: MatmulShared {
         matmul_desc.set_epilogue(act, bias.as_ref(), cfg.stride_bias)?;
 
         // Create matmul heuristic search preferences
-        let matmul_pref = MatmulPref::new()?;
+        let matmul_pref = MatmulPreference::new()?;
 
         // Set workspace size
-        matmul_pref.set_workspace_size(self.workspace().size)?;
+        matmul_pref.set_max_workspace_bytes(self.workspace().size as u64)?;
 
         // Get heuristic given Config, bias, act and workspace size
         let heuristic = result::get_matmul_algo_heuristic(
@@ -554,6 +896,364 @@ impl Matmul<half::bf16> for CudaBlasLT {
 
     fn compute_type() -> sys::cublasComputeType_t {
         sys::cublasComputeType_t::CUBLAS_COMPUTE_32F
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Scaled matmul (NVFP4 block-scaled GEMM) — requires CUDA 12.8+
+// ---------------------------------------------------------------------------
+
+#[cfg(any(
+    feature = "cuda-12080",
+    feature = "cuda-12090",
+    feature = "cuda-13000",
+    feature = "cuda-13010",
+    feature = "cuda-13020",
+    feature = "cuda-13030",
+    feature = "cuda-13040",
+))]
+/// Configuration for [ScaledMatmul].
+///
+/// Separate from [MatmulConfig] because scaled matmul has no `transc`,
+/// uses separate C (accumulator input) and D (output) leading dimensions,
+/// and does not support batching in its initial form.
+#[derive(Debug, Copy, Clone)]
+pub struct ScaledMatmulConfig {
+    /// Transpose matrix A.
+    pub transa: bool,
+    /// Transpose matrix B.
+    pub transb: bool,
+    /// Number of rows of the output matrix D.
+    pub m: u64,
+    /// Number of columns of the output matrix D.
+    pub n: u64,
+    /// Inner dimension (shared between A and B).
+    pub k: u64,
+    /// Host-side scalar multiplier: D = alpha*(A*B) + beta*C.
+    pub alpha: f32,
+    /// Host-side scalar multiplier for the accumulator input C.
+    pub beta: f32,
+    /// Leading dimension of A (logical elements, not bytes).
+    pub lda: i64,
+    /// Leading dimension of B (logical elements, not bytes).
+    pub ldb: i64,
+    /// Leading dimension of C (accumulator input).
+    pub ldc: i64,
+    /// Leading dimension of D (output).
+    pub ldd: i64,
+}
+
+#[cfg(any(
+    feature = "cuda-12080",
+    feature = "cuda-12090",
+    feature = "cuda-13000",
+    feature = "cuda-13010",
+    feature = "cuda-13020",
+    feature = "cuda-13030",
+    feature = "cuda-13040",
+))]
+/// Block-scaled matrix multiplication. See
+/// [nvidia docs](https://docs.nvidia.com/cuda/cublas/index.html#cublasltmatmul).
+///
+/// Computes D = alpha*(A*B) + beta*C with per-block scaling factors on A, B,
+/// and optionally D. This is the API used for NVFP4 inference on Blackwell GPUs.
+pub trait ScaledMatmul: MatmulShared {
+    /// Packed input type for matrices A and B (e.g. `F4E2M1x2`).
+    type Input: DeviceRepr;
+    /// Accumulator / C matrix type (e.g. `bf16`).
+    type Accum: DeviceRepr;
+    /// Output D matrix type (e.g. `bf16` or `F4E2M1x2`).
+    type Output: DeviceRepr;
+    /// Block scale factor type (e.g. `F8E4M3`).
+    type BlockScale: DeviceRepr;
+
+    /// CUDA data type for the input matrices A and B.
+    fn input_type() -> sys::cudaDataType;
+    /// CUDA data type for the accumulator matrix C.
+    fn accum_type() -> sys::cudaDataType;
+    /// CUDA data type for the output matrix D.
+    fn output_type() -> sys::cudaDataType;
+    /// Scale mode for A and B block scales.
+    fn ab_scale_mode() -> sys::cublasLtMatmulMatrixScale_t;
+    /// Scale mode for D (pre-output scaling).
+    fn d_scale_mode() -> sys::cublasLtMatmulMatrixScale_t;
+    /// Scale mode for D output block scales.
+    fn d_out_scale_mode() -> sys::cublasLtMatmulMatrixScale_t;
+
+    /// Block-scaled matrix multiplication following NVIDIA's `LtNvfp4Matmul` pattern.
+    ///
+    /// # Safety
+    /// Improper arguments (wrong dimensions, misaligned pointers, insufficient scale
+    /// buffer sizes) may lead to invalid memory accesses.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn scaled_matmul(
+        &self,
+        cfg: ScaledMatmulConfig,
+        a: &impl DevicePtr<Self::Input>,
+        b: &impl DevicePtr<Self::Input>,
+        c: &impl DevicePtr<Self::Accum>,
+        d: &mut impl DevicePtrMut<Self::Output>,
+        a_scale: &impl DevicePtr<Self::BlockScale>,
+        b_scale: &impl DevicePtr<Self::BlockScale>,
+        d_scale: &impl DevicePtr<f32>,
+        d_out_scale: &mut impl DevicePtrMut<Self::BlockScale>,
+    ) -> Result<(), CublasError> {
+        let stream = self.stream();
+        let workspace = self.workspace();
+
+        // 1. Create matmul descriptor (always f32 compute + f32 scale type)
+        let matmul_desc = MatmulDesc::new(
+            sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+            sys::cudaDataType_t::CUDA_R_32F,
+        )?;
+
+        // 2. Set transpose
+        matmul_desc.set_transpose(cfg.transa, Matrix::A)?;
+        matmul_desc.set_transpose(cfg.transb, Matrix::B)?;
+
+        // 3. Set block scaling modes
+        matmul_desc.set_scale_mode(
+            sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_A_SCALE_MODE,
+            Self::ab_scale_mode(),
+        )?;
+        matmul_desc.set_scale_mode(
+            sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_B_SCALE_MODE,
+            Self::ab_scale_mode(),
+        )?;
+        matmul_desc.set_scale_mode(
+            sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_D_SCALE_MODE,
+            Self::d_scale_mode(),
+        )?;
+        matmul_desc.set_scale_mode(
+            sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_D_OUT_SCALE_MODE,
+            Self::d_out_scale_mode(),
+        )?;
+
+        // 4. Set device-side scale pointers
+        let (a_scale_ptr, _rec_as) = a_scale.device_ptr(stream);
+        let (b_scale_ptr, _rec_bs) = b_scale.device_ptr(stream);
+        let (d_scale_ptr, _rec_ds) = d_scale.device_ptr(stream);
+        let (d_out_scale_ptr, _rec_dos) = d_out_scale.device_ptr_mut(stream);
+
+        matmul_desc.set_device_ptr_attribute(
+            sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_A_SCALE_POINTER,
+            a_scale_ptr,
+        )?;
+        matmul_desc.set_device_ptr_attribute(
+            sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_B_SCALE_POINTER,
+            b_scale_ptr,
+        )?;
+        matmul_desc.set_device_ptr_attribute(
+            sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_D_SCALE_POINTER,
+            d_scale_ptr,
+        )?;
+        matmul_desc.set_device_ptr_attribute(
+            sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_D_OUT_SCALE_POINTER,
+            d_out_scale_ptr as CUdeviceptr,
+        )?;
+
+        // 5. Create matrix layouts
+        let (a_rows, a_cols) = if cfg.transa {
+            (cfg.k, cfg.m)
+        } else {
+            (cfg.m, cfg.k)
+        };
+        let (b_rows, b_cols) = if cfg.transb {
+            (cfg.n, cfg.k)
+        } else {
+            (cfg.k, cfg.n)
+        };
+
+        let a_layout = MatrixLayout::new(Self::input_type(), a_rows, a_cols, cfg.lda)?;
+        let b_layout = MatrixLayout::new(Self::input_type(), b_rows, b_cols, cfg.ldb)?;
+        let c_layout = MatrixLayout::new(Self::accum_type(), cfg.m, cfg.n, cfg.ldc)?;
+        let d_layout = MatrixLayout::new(Self::output_type(), cfg.m, cfg.n, cfg.ldd)?;
+
+        // 6. Heuristic search
+        let matmul_pref = MatmulPreference::new()?;
+        matmul_pref.set_max_workspace_bytes(workspace.size as u64)?;
+
+        let heuristic = result::get_matmul_algo_heuristic(
+            *self.handle(),
+            matmul_desc.handle,
+            a_layout.handle,
+            b_layout.handle,
+            c_layout.handle,
+            d_layout.handle,
+            matmul_pref.handle,
+        )?;
+
+        // 7. Execute matmul
+        let (a_ptr, _rec_a) = a.device_ptr(stream);
+        let (b_ptr, _rec_b) = b.device_ptr(stream);
+        let (c_ptr, _rec_c) = c.device_ptr(stream);
+        let (d_ptr, _rec_d) = d.device_ptr_mut(stream);
+        let (w_ptr, _rec_w) = workspace.buffer.device_ptr(stream);
+
+        result::matmul(
+            *self.handle(),
+            matmul_desc.handle,
+            (&cfg.alpha) as *const _ as *const _,
+            (&cfg.beta) as *const _ as *const _,
+            a_ptr as *const _,
+            a_layout.handle,
+            b_ptr as *const _,
+            b_layout.handle,
+            c_ptr as *const _,
+            c_layout.handle,
+            d_ptr as *mut _,
+            d_layout.handle,
+            (&heuristic.algo) as *const _,
+            w_ptr as *mut _,
+            workspace.size,
+            stream.cu_stream() as *mut _,
+        )
+    }
+}
+
+// NvFP4 → bf16 output configuration
+#[cfg(all(
+    any(
+        feature = "cuda-12080",
+        feature = "cuda-12090",
+        feature = "cuda-13000",
+        feature = "cuda-13010",
+        feature = "cuda-13020",
+        feature = "cuda-13030",
+        feature = "cuda-13040",
+    ),
+    feature = "f4",
+    feature = "f8",
+    feature = "f16",
+))]
+impl ScaledMatmul for CudaBlasLT {
+    type Input = float4::F4E2M1x2;
+    type Accum = half::bf16;
+    type Output = half::bf16;
+    type BlockScale = float8::F8E4M3;
+
+    fn input_type() -> sys::cudaDataType {
+        sys::cudaDataType_t::CUDA_R_4F_E2M1
+    }
+
+    fn accum_type() -> sys::cudaDataType {
+        sys::cudaDataType_t::CUDA_R_16BF
+    }
+
+    fn output_type() -> sys::cudaDataType {
+        sys::cudaDataType_t::CUDA_R_16BF
+    }
+
+    fn ab_scale_mode() -> sys::cublasLtMatmulMatrixScale_t {
+        sys::cublasLtMatmulMatrixScale_t::CUBLASLT_MATMUL_MATRIX_SCALE_VEC16_UE4M3
+    }
+
+    fn d_scale_mode() -> sys::cublasLtMatmulMatrixScale_t {
+        sys::cublasLtMatmulMatrixScale_t::CUBLASLT_MATMUL_MATRIX_SCALE_SCALAR_32F
+    }
+
+    fn d_out_scale_mode() -> sys::cublasLtMatmulMatrixScale_t {
+        sys::cublasLtMatmulMatrixScale_t::CUBLASLT_MATMUL_MATRIX_SCALE_VEC16_UE4M3
+    }
+}
+
+// NvFP4 → FP4 output configuration (via newtype wrapper)
+#[cfg(all(
+    any(
+        feature = "cuda-12080",
+        feature = "cuda-12090",
+        feature = "cuda-13000",
+        feature = "cuda-13010",
+        feature = "cuda-13020",
+        feature = "cuda-13030",
+        feature = "cuda-13040",
+    ),
+    feature = "f4",
+    feature = "f8",
+    feature = "f16",
+))]
+/// Newtype wrapper around [CudaBlasLT] that selects FP4 output for [ScaledMatmul].
+///
+/// Use this when you want the matmul result written back as packed FP4 (`F4E2M1x2`)
+/// instead of bf16. The kernel will also compute and write block scale factors to
+/// `d_out_scale`.
+///
+/// ```ignore
+/// let fp4_out = NvFp4Output(&blas);
+/// unsafe { fp4_out.scaled_matmul(cfg, &a, &b, &c, &mut d, ...) };
+/// ```
+pub struct NvFp4Output<'a>(pub &'a CudaBlasLT);
+
+#[cfg(all(
+    any(
+        feature = "cuda-12080",
+        feature = "cuda-12090",
+        feature = "cuda-13000",
+        feature = "cuda-13010",
+        feature = "cuda-13020",
+        feature = "cuda-13030",
+        feature = "cuda-13040",
+    ),
+    feature = "f4",
+    feature = "f8",
+    feature = "f16",
+))]
+impl MatmulShared for NvFp4Output<'_> {
+    fn handle(&self) -> &sys::cublasLtHandle_t {
+        self.0.handle()
+    }
+
+    fn workspace(&self) -> &Workspace {
+        self.0.workspace()
+    }
+
+    fn stream(&self) -> &Arc<CudaStream> {
+        self.0.stream()
+    }
+}
+
+#[cfg(all(
+    any(
+        feature = "cuda-12080",
+        feature = "cuda-12090",
+        feature = "cuda-13000",
+        feature = "cuda-13010",
+        feature = "cuda-13020",
+        feature = "cuda-13030",
+        feature = "cuda-13040",
+    ),
+    feature = "f4",
+    feature = "f8",
+    feature = "f16",
+))]
+impl ScaledMatmul for NvFp4Output<'_> {
+    type Input = float4::F4E2M1x2;
+    type Accum = half::bf16;
+    type Output = float4::F4E2M1x2;
+    type BlockScale = float8::F8E4M3;
+
+    fn input_type() -> sys::cudaDataType {
+        sys::cudaDataType_t::CUDA_R_4F_E2M1
+    }
+
+    fn accum_type() -> sys::cudaDataType {
+        sys::cudaDataType_t::CUDA_R_16BF
+    }
+
+    fn output_type() -> sys::cudaDataType {
+        sys::cudaDataType_t::CUDA_R_4F_E2M1
+    }
+
+    fn ab_scale_mode() -> sys::cublasLtMatmulMatrixScale_t {
+        sys::cublasLtMatmulMatrixScale_t::CUBLASLT_MATMUL_MATRIX_SCALE_VEC16_UE4M3
+    }
+
+    fn d_scale_mode() -> sys::cublasLtMatmulMatrixScale_t {
+        sys::cublasLtMatmulMatrixScale_t::CUBLASLT_MATMUL_MATRIX_SCALE_SCALAR_32F
+    }
+
+    fn d_out_scale_mode() -> sys::cublasLtMatmulMatrixScale_t {
+        sys::cublasLtMatmulMatrixScale_t::CUBLASLT_MATMUL_MATRIX_SCALE_VEC16_UE4M3
     }
 }
 
@@ -852,6 +1552,823 @@ mod tests {
                     "found={found:?}, expected={expected:?}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn test_matmul_op_pick_algorithm() {
+        let ctx = CudaContext::new(0).unwrap();
+        let stream = ctx.default_stream();
+        let blas = CudaBlasLT::new(stream.clone()).unwrap();
+        const M: usize = 3;
+        const K: usize = 4;
+        const N: usize = 5;
+
+        #[rustfmt::skip]
+        let a_dev = stream.clone_htod(&[
+            -0.5944882f32, 1.8055636, 0.52204555, -0.00397902,
+            -0.38346434, -0.38013917, 0.4198623, -0.22479166,
+            -1.6661372, -0.4568837, -0.9043474, 0.39125723,
+        ]).unwrap();
+        #[rustfmt::skip]
+        let b_dev = stream.clone_htod(&[
+            1.1292169f32, -0.13450263, 0.62789696, -0.5685516, 0.21946938,
+            1.0585804, -0.39789402, 0.90205914, 0.989318, -0.3443096,
+            1.3412506, 0.3059701, -0.9714474, -0.36113533, -1.6809629,
+            3.4746711, -1.0930681, 0.16502666, -0.59988785, 0.41375792,
+        ]).unwrap();
+
+        let cfg = MatmulConfig {
+            transa: false,
+            transb: false,
+            transc: false,
+            m: N as u64,
+            n: M as u64,
+            k: K as u64,
+            alpha: 1.0,
+            lda: N as i64,
+            ldb: K as i64,
+            beta: 0.0,
+            ldc: N as i64,
+            stride_a: None,
+            stride_b: None,
+            stride_c: None,
+            stride_bias: None,
+            batch_size: None,
+        };
+
+        // Reference: use existing matmul()
+        let mut c_ref = stream.alloc_zeros::<f32>(M * N).unwrap();
+        unsafe {
+            blas.matmul(
+                cfg,
+                &b_dev,
+                &a_dev,
+                &mut c_ref,
+                None::<&CudaSlice<f32>>,
+                None,
+            )
+        }
+        .unwrap();
+        let c_ref_host = stream.clone_dtoh(&c_ref).unwrap();
+
+        // New API: use MatmulOperation
+        let mut op = blas.matmul_op::<f32>(&cfg).unwrap();
+        let pref = MatmulPreference::new().unwrap();
+        pref.set_max_workspace_bytes(blas.workspace().size as u64)
+            .unwrap();
+        let algo = op.pick_algorithm(&pref).unwrap();
+
+        let mut c_new = stream.alloc_zeros::<f32>(M * N).unwrap();
+        unsafe {
+            op.launch(
+                &algo,
+                blas.workspace(),
+                1.0,
+                0.0,
+                &b_dev,
+                &a_dev,
+                &mut c_new,
+                None::<&CudaSlice<f32>>,
+                None,
+            )
+        }
+        .unwrap();
+        let c_new_host = stream.clone_dtoh(&c_new).unwrap();
+
+        for i in 0..(M * N) {
+            assert!(
+                (c_ref_host[i] - c_new_host[i]).abs() <= 1e-6,
+                "index={i}, ref={}, new={}",
+                c_ref_host[i],
+                c_new_host[i]
+            );
+        }
+    }
+
+    #[test]
+    fn test_matmul_op_pick_algorithms() {
+        let ctx = CudaContext::new(0).unwrap();
+        let stream = ctx.default_stream();
+        let blas = CudaBlasLT::new(stream.clone()).unwrap();
+
+        let cfg = MatmulConfig {
+            transa: false,
+            transb: false,
+            transc: false,
+            m: 64,
+            n: 64,
+            k: 64,
+            alpha: 1.0,
+            lda: 64,
+            ldb: 64,
+            beta: 0.0,
+            ldc: 64,
+            stride_a: None,
+            stride_b: None,
+            stride_c: None,
+            stride_bias: None,
+            batch_size: None,
+        };
+
+        let op = blas.matmul_op::<f32>(&cfg).unwrap();
+        let pref = MatmulPreference::new().unwrap();
+        pref.set_max_workspace_bytes(blas.workspace().size as u64)
+            .unwrap();
+
+        let algos = op.pick_algorithms(&pref, 8).unwrap();
+        assert!(
+            !algos.is_empty(),
+            "Expected at least one algorithm from heuristic search"
+        );
+    }
+
+    #[test]
+    fn test_matmul_op_algo_enumeration() {
+        let ctx = CudaContext::new(0).unwrap();
+        let stream = ctx.default_stream();
+        let blas = CudaBlasLT::new(stream.clone()).unwrap();
+
+        let cfg = MatmulConfig {
+            transa: false,
+            transb: false,
+            transc: false,
+            m: 32,
+            n: 32,
+            k: 32,
+            alpha: 1.0,
+            lda: 32,
+            ldb: 32,
+            beta: 0.0,
+            ldc: 32,
+            stride_a: None,
+            stride_b: None,
+            stride_c: None,
+            stride_bias: None,
+            batch_size: None,
+        };
+
+        let op = blas.matmul_op::<f32>(&cfg).unwrap();
+
+        // Get algorithm IDs
+        let ids = op.get_algo_ids(32).unwrap();
+        assert!(!ids.is_empty(), "Expected at least one algorithm ID");
+
+        // Initialize and validate from ID
+        let mut valid_count = 0;
+        for &id in &ids {
+            if op.algo_from_id(id).is_ok() {
+                valid_count += 1;
+            }
+        }
+        assert!(valid_count > 0, "Expected at least one valid algorithm");
+    }
+
+    #[test]
+    fn test_workspace_constrained_correctness() {
+        let ctx = CudaContext::new(0).unwrap();
+        let stream = ctx.default_stream();
+        let blas = CudaBlasLT::new(stream.clone()).unwrap();
+        const M: usize = 3;
+        const K: usize = 4;
+        const N: usize = 5;
+
+        #[rustfmt::skip]
+        let a_dev = stream.clone_htod(&[
+            -0.5944882f32, 1.8055636, 0.52204555, -0.00397902,
+            -0.38346434, -0.38013917, 0.4198623, -0.22479166,
+            -1.6661372, -0.4568837, -0.9043474, 0.39125723,
+        ]).unwrap();
+        #[rustfmt::skip]
+        let b_dev = stream.clone_htod(&[
+            1.1292169f32, -0.13450263, 0.62789696, -0.5685516, 0.21946938,
+            1.0585804, -0.39789402, 0.90205914, 0.989318, -0.3443096,
+            1.3412506, 0.3059701, -0.9714474, -0.36113533, -1.6809629,
+            3.4746711, -1.0930681, 0.16502666, -0.59988785, 0.41375792,
+        ]).unwrap();
+
+        let cfg = MatmulConfig {
+            transa: false,
+            transb: false,
+            transc: false,
+            m: N as u64,
+            n: M as u64,
+            k: K as u64,
+            alpha: 1.0,
+            lda: N as i64,
+            ldb: K as i64,
+            beta: 0.0,
+            ldc: N as i64,
+            stride_a: None,
+            stride_b: None,
+            stride_c: None,
+            stride_bias: None,
+            batch_size: None,
+        };
+
+        // Reference: unconstrained matmul
+        let mut c_ref = stream.alloc_zeros::<f32>(M * N).unwrap();
+        unsafe {
+            blas.matmul(
+                cfg,
+                &b_dev,
+                &a_dev,
+                &mut c_ref,
+                None::<&CudaSlice<f32>>,
+                None,
+            )
+        }
+        .unwrap();
+        let c_ref_host = stream.clone_dtoh(&c_ref).unwrap();
+
+        // Constrained: workspace = 0 bytes (most restrictive)
+        let mut op = blas.matmul_op::<f32>(&cfg).unwrap();
+        let pref = MatmulPreference::new().unwrap();
+        pref.set_max_workspace_bytes(0).unwrap();
+        let algo = op.pick_algorithm(&pref).unwrap();
+
+        let mut c_constrained = stream.alloc_zeros::<f32>(M * N).unwrap();
+        unsafe {
+            op.launch(
+                &algo,
+                blas.workspace(),
+                1.0,
+                0.0,
+                &b_dev,
+                &a_dev,
+                &mut c_constrained,
+                None::<&CudaSlice<f32>>,
+                None,
+            )
+        }
+        .unwrap();
+        let c_constrained_host = stream.clone_dtoh(&c_constrained).unwrap();
+
+        for i in 0..(M * N) {
+            assert!(
+                (c_ref_host[i] - c_constrained_host[i]).abs() <= 1e-5,
+                "Workspace-constrained result differs at index={i}: ref={}, constrained={}",
+                c_ref_host[i],
+                c_constrained_host[i]
+            );
+        }
+    }
+
+    #[test]
+    fn test_pinned_algorithm_reproducibility() {
+        let ctx = CudaContext::new(0).unwrap();
+        let stream = ctx.default_stream();
+        let blas = CudaBlasLT::new(stream.clone()).unwrap();
+        const M: usize = 3;
+        const K: usize = 4;
+        const N: usize = 5;
+
+        #[rustfmt::skip]
+        let a_dev = stream.clone_htod(&[
+            -0.5944882f32, 1.8055636, 0.52204555, -0.00397902,
+            -0.38346434, -0.38013917, 0.4198623, -0.22479166,
+            -1.6661372, -0.4568837, -0.9043474, 0.39125723,
+        ]).unwrap();
+        #[rustfmt::skip]
+        let b_dev = stream.clone_htod(&[
+            1.1292169f32, -0.13450263, 0.62789696, -0.5685516, 0.21946938,
+            1.0585804, -0.39789402, 0.90205914, 0.989318, -0.3443096,
+            1.3412506, 0.3059701, -0.9714474, -0.36113533, -1.6809629,
+            3.4746711, -1.0930681, 0.16502666, -0.59988785, 0.41375792,
+        ]).unwrap();
+
+        let cfg = MatmulConfig {
+            transa: false,
+            transb: false,
+            transc: false,
+            m: N as u64,
+            n: M as u64,
+            k: K as u64,
+            alpha: 1.0,
+            lda: N as i64,
+            ldb: K as i64,
+            beta: 0.0,
+            ldc: N as i64,
+            stride_a: None,
+            stride_b: None,
+            stride_c: None,
+            stride_bias: None,
+            batch_size: None,
+        };
+
+        let mut op = blas.matmul_op::<f32>(&cfg).unwrap();
+
+        // Find a valid algorithm via enumeration
+        let ids = op.get_algo_ids(32).unwrap();
+        let mut pinned_algo = None;
+        for &id in &ids {
+            if let Ok(algo) = op.algo_from_id(id) {
+                if algo.workspace_size <= blas.workspace().size {
+                    pinned_algo = Some(algo);
+                    break;
+                }
+            }
+        }
+        let algo = pinned_algo.expect("Expected at least one valid algorithm");
+
+        // Run twice with same pinned algorithm
+        let mut c1 = stream.alloc_zeros::<f32>(M * N).unwrap();
+        unsafe {
+            op.launch(
+                &algo,
+                blas.workspace(),
+                1.0,
+                0.0,
+                &b_dev,
+                &a_dev,
+                &mut c1,
+                None::<&CudaSlice<f32>>,
+                None,
+            )
+        }
+        .unwrap();
+        let c1_host = stream.clone_dtoh(&c1).unwrap();
+
+        let mut c2 = stream.alloc_zeros::<f32>(M * N).unwrap();
+        unsafe {
+            op.launch(
+                &algo,
+                blas.workspace(),
+                1.0,
+                0.0,
+                &b_dev,
+                &a_dev,
+                &mut c2,
+                None::<&CudaSlice<f32>>,
+                None,
+            )
+        }
+        .unwrap();
+        let c2_host = stream.clone_dtoh(&c2).unwrap();
+
+        // Bitwise identical results
+        for i in 0..(M * N) {
+            assert_eq!(
+                c1_host[i].to_bits(),
+                c2_host[i].to_bits(),
+                "Pinned algorithm produced different results at index={i}: run1={}, run2={}",
+                c1_host[i],
+                c2_host[i]
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Scaled matmul (NVFP4) tests — require Blackwell GPU + CUDA 12.8+
+    // -----------------------------------------------------------------------
+
+    #[cfg(all(
+        any(
+            feature = "cuda-12080",
+            feature = "cuda-12090",
+            feature = "cuda-13000",
+            feature = "cuda-13010",
+            feature = "cuda-13020",
+            feature = "cuda-13030",
+            feature = "cuda-13040",
+        ),
+        feature = "f4",
+        feature = "f8",
+        feature = "f16",
+    ))]
+    mod scaled_matmul_tests {
+        use super::*;
+
+        /// CPU reference: unpack FP4 values, apply block scales, multiply as f32.
+        /// Returns row-major f32 result matrix of shape [m][n].
+        fn scaled_matmul_reference(
+            a_packed: &[float4::F4E2M1x2],
+            b_packed: &[float4::F4E2M1x2],
+            a_scales: &[float8::F8E4M3],
+            b_scales: &[float8::F8E4M3],
+            m: usize,
+            n: usize,
+            k: usize,
+            alpha: f32,
+            beta: f32,
+            c_bf16: &[half::bf16],
+        ) -> Vec<f32> {
+            // Unpack A: m rows, k cols (k/2 packed bytes per row)
+            let mut a_f32 = vec![0.0f32; m * k];
+            for row in 0..m {
+                for col_pair in 0..(k / 2) {
+                    let idx = row * (k / 2) + col_pair;
+                    let (lo, hi) = a_packed[idx].to_f32_pair();
+                    a_f32[row * k + col_pair * 2] = lo;
+                    a_f32[row * k + col_pair * 2 + 1] = hi;
+                }
+            }
+
+            // Unpack B: k rows, n cols (n/2 packed bytes per row)
+            let mut b_f32 = vec![0.0f32; k * n];
+            for row in 0..k {
+                for col_pair in 0..(n / 2) {
+                    let idx = row * (n / 2) + col_pair;
+                    let (lo, hi) = b_packed[idx].to_f32_pair();
+                    b_f32[row * n + col_pair * 2] = lo;
+                    b_f32[row * n + col_pair * 2 + 1] = hi;
+                }
+            }
+
+            // Apply block scales (16-element blocks along K)
+            // A scales: one per (row, k_block), layout [m, k/16]
+            for row in 0..m {
+                for col in 0..k {
+                    let block_idx = row * (k / 16) + col / 16;
+                    let scale = f32::from(a_scales[block_idx]);
+                    a_f32[row * k + col] *= scale;
+                }
+            }
+            // B scales: one per (col, k_block), layout [n, k/16]
+            for row in 0..k {
+                for col in 0..n {
+                    let block_idx = col * (k / 16) + row / 16;
+                    let scale = f32::from(b_scales[block_idx]);
+                    b_f32[row * n + col] *= scale;
+                }
+            }
+
+            // Matmul: D = alpha * (A @ B) + beta * C
+            let mut d = vec![0.0f32; m * n];
+            for i in 0..m {
+                for j in 0..n {
+                    let mut sum = 0.0f32;
+                    for p in 0..k {
+                        sum += a_f32[i * k + p] * b_f32[p * n + j];
+                    }
+                    let c_val = half::bf16::to_f32(c_bf16[i * n + j]);
+                    d[i * n + j] = alpha * sum + beta * c_val;
+                }
+            }
+            d
+        }
+
+        #[test]
+        fn test_scaled_matmul_type_mapping_bf16_output() {
+            assert_eq!(
+                <CudaBlasLT as ScaledMatmul>::input_type(),
+                sys::cudaDataType_t::CUDA_R_4F_E2M1
+            );
+            assert_eq!(
+                <CudaBlasLT as ScaledMatmul>::accum_type(),
+                sys::cudaDataType_t::CUDA_R_16BF
+            );
+            assert_eq!(
+                <CudaBlasLT as ScaledMatmul>::output_type(),
+                sys::cudaDataType_t::CUDA_R_16BF
+            );
+            assert_eq!(
+                <CudaBlasLT as ScaledMatmul>::ab_scale_mode(),
+                sys::cublasLtMatmulMatrixScale_t::CUBLASLT_MATMUL_MATRIX_SCALE_VEC16_UE4M3
+            );
+            assert_eq!(
+                <CudaBlasLT as ScaledMatmul>::d_scale_mode(),
+                sys::cublasLtMatmulMatrixScale_t::CUBLASLT_MATMUL_MATRIX_SCALE_SCALAR_32F
+            );
+            assert_eq!(
+                <CudaBlasLT as ScaledMatmul>::d_out_scale_mode(),
+                sys::cublasLtMatmulMatrixScale_t::CUBLASLT_MATMUL_MATRIX_SCALE_VEC16_UE4M3
+            );
+        }
+
+        #[test]
+        fn test_scaled_matmul_type_mapping_fp4_output() {
+            assert_eq!(
+                <NvFp4Output as ScaledMatmul>::input_type(),
+                sys::cudaDataType_t::CUDA_R_4F_E2M1
+            );
+            assert_eq!(
+                <NvFp4Output as ScaledMatmul>::accum_type(),
+                sys::cudaDataType_t::CUDA_R_16BF
+            );
+            assert_eq!(
+                <NvFp4Output as ScaledMatmul>::output_type(),
+                sys::cudaDataType_t::CUDA_R_4F_E2M1
+            );
+        }
+
+        #[test]
+        fn test_scaled_matmul_nvfp4_to_bf16() {
+            let logpath = CString::new("log_scaled_matmul_bf16").unwrap();
+            unsafe { sys::cublasLtLoggerSetLevel(4).result().unwrap() };
+            unsafe {
+                sys::cublasLtLoggerOpenFile(logpath.as_ptr())
+                    .result()
+                    .unwrap()
+            };
+
+            let ctx = CudaContext::new(0).unwrap();
+            let stream = ctx.default_stream();
+            let blas = CudaBlasLT::new(stream.clone()).unwrap();
+
+            const M: usize = 64;
+            const N: usize = 64;
+            const K: usize = 128;
+
+            // Build known FP4 values: pack (1.0, 0.5) pairs
+            let a_packed: Vec<float4::F4E2M1x2> = (0..M * K / 2)
+                .map(|i| {
+                    let v0 = float4::F4E2M1::from(((i % 7) as f32) * 0.5);
+                    let v1 = float4::F4E2M1::from(((i % 5) as f32) * 0.5);
+                    float4::F4E2M1x2::new(v0, v1)
+                })
+                .collect();
+            let b_packed: Vec<float4::F4E2M1x2> = (0..K * N / 2)
+                .map(|i| {
+                    let v0 = float4::F4E2M1::from(((i % 3) as f32) * 0.5);
+                    let v1 = float4::F4E2M1::from(((i % 6) as f32) * 0.5);
+                    float4::F4E2M1x2::new(v0, v1)
+                })
+                .collect();
+
+            // All scales = 1.0 (identity scaling)
+            let a_scales = vec![float8::F8E4M3::from(1.0f32); M * (K / 16)];
+            let b_scales = vec![float8::F8E4M3::from(1.0f32); N * (K / 16)];
+            let d_scale = vec![1.0f32];
+            let d_out_scale = vec![float8::F8E4M3::from(1.0f32); M * (N / 16)];
+            let c_data = vec![half::bf16::from_f32(0.0); M * N];
+
+            // CPU reference
+            let expected = scaled_matmul_reference(
+                &a_packed, &b_packed, &a_scales, &b_scales, M, N, K, 1.0, 0.0, &c_data,
+            );
+
+            // Upload to device
+            let a_dev = stream.clone_htod(&a_packed).unwrap();
+            let b_dev = stream.clone_htod(&b_packed).unwrap();
+            let c_dev = stream.clone_htod(&c_data).unwrap();
+            let mut d_dev = stream.alloc_zeros::<half::bf16>(M * N).unwrap();
+            let a_scale_dev = stream.clone_htod(&a_scales).unwrap();
+            let b_scale_dev = stream.clone_htod(&b_scales).unwrap();
+            let d_scale_dev = stream.clone_htod(&d_scale).unwrap();
+            let mut d_out_scale_dev = stream.clone_htod(&d_out_scale).unwrap();
+
+            // cuBLASLt uses column-major: swap m/n and A/B for row-major data
+            let cfg = ScaledMatmulConfig {
+                transa: false,
+                transb: false,
+                m: N as u64,
+                n: M as u64,
+                k: K as u64,
+                alpha: 1.0,
+                beta: 0.0,
+                lda: N as i64,
+                ldb: K as i64,
+                ldc: N as i64,
+                ldd: N as i64,
+            };
+
+            unsafe {
+                blas.scaled_matmul(
+                    cfg,
+                    &b_dev,
+                    &a_dev,
+                    &c_dev,
+                    &mut d_dev,
+                    &b_scale_dev,
+                    &a_scale_dev,
+                    &d_scale_dev,
+                    &mut d_out_scale_dev,
+                )
+                .unwrap();
+            }
+
+            let d_host = stream.clone_dtoh(&d_dev).unwrap();
+            for i in 0..M {
+                for j in 0..N {
+                    let found = half::bf16::to_f32(d_host[i * N + j]);
+                    let exp = expected[i * N + j];
+                    let tol = 1.0 + exp.abs() * 0.1;
+                    assert!(
+                        (found - exp).abs() <= tol,
+                        "mismatch at [{i},{j}]: found={found}, expected={exp}"
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn test_scaled_matmul_nvfp4_beta_accumulation() {
+            let ctx = CudaContext::new(0).unwrap();
+            let stream = ctx.default_stream();
+            let blas = CudaBlasLT::new(stream.clone()).unwrap();
+
+            const M: usize = 32;
+            const N: usize = 32;
+            const K: usize = 64;
+
+            // Zero inputs, non-zero C, beta=1.0 => D should equal C
+            let a_packed = vec![float4::F4E2M1x2::ZERO; M * K / 2];
+            let b_packed = vec![float4::F4E2M1x2::ZERO; K * N / 2];
+            let a_scales = vec![float8::F8E4M3::from(1.0f32); M * (K / 16)];
+            let b_scales = vec![float8::F8E4M3::from(1.0f32); N * (K / 16)];
+            let d_scale = vec![1.0f32];
+            let d_out_scale = vec![float8::F8E4M3::from(1.0f32); M * (N / 16)];
+
+            let c_data: Vec<half::bf16> = (0..M * N)
+                .map(|i| half::bf16::from_f32((i % 17) as f32 * 0.1))
+                .collect();
+
+            let a_dev = stream.clone_htod(&a_packed).unwrap();
+            let b_dev = stream.clone_htod(&b_packed).unwrap();
+            let c_dev = stream.clone_htod(&c_data).unwrap();
+            let mut d_dev = stream.alloc_zeros::<half::bf16>(M * N).unwrap();
+            let a_scale_dev = stream.clone_htod(&a_scales).unwrap();
+            let b_scale_dev = stream.clone_htod(&b_scales).unwrap();
+            let d_scale_dev = stream.clone_htod(&d_scale).unwrap();
+            let mut d_out_scale_dev = stream.clone_htod(&d_out_scale).unwrap();
+
+            let cfg = ScaledMatmulConfig {
+                transa: false,
+                transb: false,
+                m: N as u64,
+                n: M as u64,
+                k: K as u64,
+                alpha: 1.0,
+                beta: 1.0,
+                lda: N as i64,
+                ldb: K as i64,
+                ldc: N as i64,
+                ldd: N as i64,
+            };
+
+            unsafe {
+                blas.scaled_matmul(
+                    cfg,
+                    &b_dev,
+                    &a_dev,
+                    &c_dev,
+                    &mut d_dev,
+                    &b_scale_dev,
+                    &a_scale_dev,
+                    &d_scale_dev,
+                    &mut d_out_scale_dev,
+                )
+                .unwrap();
+            }
+
+            let d_host = stream.clone_dtoh(&d_dev).unwrap();
+            for i in 0..M * N {
+                let found = half::bf16::to_f32(d_host[i]);
+                let exp = half::bf16::to_f32(c_data[i]);
+                assert!(
+                    (found - exp).abs() <= 1e-2,
+                    "mismatch at [{i}]: found={found}, expected={exp}"
+                );
+            }
+        }
+
+        #[test]
+        fn test_scaled_matmul_nvfp4_to_fp4_output() {
+            let ctx = CudaContext::new(0).unwrap();
+            let stream = ctx.default_stream();
+            let blas = CudaBlasLT::new(stream.clone()).unwrap();
+
+            const M: usize = 64;
+            const N: usize = 64;
+            const K: usize = 128;
+
+            let a_packed: Vec<float4::F4E2M1x2> = (0..M * K / 2)
+                .map(|i| {
+                    let v0 = float4::F4E2M1::from(((i % 4) as f32) * 0.5);
+                    let v1 = float4::F4E2M1::from(((i % 3) as f32) * 0.5);
+                    float4::F4E2M1x2::new(v0, v1)
+                })
+                .collect();
+            let b_packed: Vec<float4::F4E2M1x2> = (0..K * N / 2)
+                .map(|i| {
+                    let v0 = float4::F4E2M1::from(((i % 5) as f32) * 0.5);
+                    let v1 = float4::F4E2M1::from(((i % 2) as f32) * 0.5);
+                    float4::F4E2M1x2::new(v0, v1)
+                })
+                .collect();
+
+            let a_scales = vec![float8::F8E4M3::from(1.0f32); M * (K / 16)];
+            let b_scales = vec![float8::F8E4M3::from(1.0f32); N * (K / 16)];
+            let d_scale = vec![1.0f32];
+            let d_out_scale_data = vec![float8::F8E4M3::from(0.0f32); M * (N / 16)];
+            let c_data = vec![half::bf16::from_f32(0.0); M * N];
+
+            let a_dev = stream.clone_htod(&a_packed).unwrap();
+            let b_dev = stream.clone_htod(&b_packed).unwrap();
+            let c_dev = stream.clone_htod(&c_data).unwrap();
+            let mut d_dev = stream.alloc_zeros::<float4::F4E2M1x2>(M * N / 2).unwrap();
+            let a_scale_dev = stream.clone_htod(&a_scales).unwrap();
+            let b_scale_dev = stream.clone_htod(&b_scales).unwrap();
+            let d_scale_dev = stream.clone_htod(&d_scale).unwrap();
+            let mut d_out_scale_dev = stream.clone_htod(&d_out_scale_data).unwrap();
+
+            let fp4_out = NvFp4Output(&blas);
+            let cfg = ScaledMatmulConfig {
+                transa: false,
+                transb: false,
+                m: N as u64,
+                n: M as u64,
+                k: K as u64,
+                alpha: 1.0,
+                beta: 0.0,
+                lda: N as i64,
+                ldb: K as i64,
+                ldc: N as i64,
+                ldd: N as i64,
+            };
+
+            unsafe {
+                fp4_out
+                    .scaled_matmul(
+                        cfg,
+                        &b_dev,
+                        &a_dev,
+                        &c_dev,
+                        &mut d_dev,
+                        &b_scale_dev,
+                        &a_scale_dev,
+                        &d_scale_dev,
+                        &mut d_out_scale_dev,
+                    )
+                    .unwrap();
+            }
+
+            // Verify D has non-zero output (FP4 packed)
+            let d_host = stream.clone_dtoh(&d_dev).unwrap();
+            let any_nonzero = d_host.iter().any(|v| v.to_bits() != 0);
+            assert!(any_nonzero, "FP4 output should contain non-zero values");
+
+            // Verify d_out_scale was written (kernel computes output block scales)
+            let out_scales = stream.clone_dtoh(&d_out_scale_dev).unwrap();
+            let any_scale_nonzero = out_scales.iter().any(|v| f32::from(*v) != 0.0);
+            assert!(
+                any_scale_nonzero,
+                "d_out_scale should be written by the kernel"
+            );
+        }
+
+        #[test]
+        fn test_scaled_matmul_nvfp4_vector_matrix() {
+            let ctx = CudaContext::new(0).unwrap();
+            let stream = ctx.default_stream();
+            let blas = CudaBlasLT::new(stream.clone()).unwrap();
+
+            // M=1 is a common inference pattern (single-token decode)
+            const M: usize = 1;
+            const N: usize = 128;
+            const K: usize = 64;
+
+            let a_packed = vec![float4::F4E2M1x2::from_bits(0x31); M * K / 2];
+            let b_packed = vec![float4::F4E2M1x2::from_bits(0x31); K * N / 2];
+            let a_scales = vec![float8::F8E4M3::from(1.0f32); M * (K / 16)];
+            let b_scales = vec![float8::F8E4M3::from(1.0f32); N * (K / 16)];
+            let d_scale = vec![1.0f32];
+            let d_out_scale = vec![float8::F8E4M3::from(1.0f32); M * (N / 16)];
+            let c_data = vec![half::bf16::from_f32(0.0); M * N];
+
+            let a_dev = stream.clone_htod(&a_packed).unwrap();
+            let b_dev = stream.clone_htod(&b_packed).unwrap();
+            let c_dev = stream.clone_htod(&c_data).unwrap();
+            let mut d_dev = stream.alloc_zeros::<half::bf16>(M * N).unwrap();
+            let a_scale_dev = stream.clone_htod(&a_scales).unwrap();
+            let b_scale_dev = stream.clone_htod(&b_scales).unwrap();
+            let d_scale_dev = stream.clone_htod(&d_scale).unwrap();
+            let mut d_out_scale_dev = stream.clone_htod(&d_out_scale).unwrap();
+
+            let cfg = ScaledMatmulConfig {
+                transa: false,
+                transb: false,
+                m: N as u64,
+                n: M as u64,
+                k: K as u64,
+                alpha: 1.0,
+                beta: 0.0,
+                lda: N as i64,
+                ldb: K as i64,
+                ldc: N as i64,
+                ldd: N as i64,
+            };
+
+            unsafe {
+                blas.scaled_matmul(
+                    cfg,
+                    &b_dev,
+                    &a_dev,
+                    &c_dev,
+                    &mut d_dev,
+                    &b_scale_dev,
+                    &a_scale_dev,
+                    &d_scale_dev,
+                    &mut d_out_scale_dev,
+                )
+                .unwrap();
+            }
+
+            let d_host = stream.clone_dtoh(&d_dev).unwrap();
+            // With constant inputs the result should be uniform across columns
+            let first = half::bf16::to_f32(d_host[0]);
+            assert!(first.is_finite(), "result should be finite, got {first}");
         }
     }
 }

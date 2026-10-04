@@ -68,6 +68,7 @@ impl CudaStream {
     /// See [cuda docs](https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__STREAM.html#group__CUDA__STREAM_1g03dab8b2ba76b00718955177a929970c)
     ///
     /// `flags` is passed to [cuGraphInstantiate](https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__GRAPH.html#group__CUDA__GRAPH_1gb53b435e178cccfa37ac87285d2c3fa1)
+    /// Pass `sys::CUgraphInstantiate_flags(0)` for default behavior, or combine flags with `|`.
     #[allow(deprecated)]
     pub fn end_capture(
         self: &Arc<Self>,
@@ -78,12 +79,12 @@ impl CudaStream {
         if cu_graph.is_null() {
             return Ok(None);
         }
-        // Clean up the graph if instantiation fails to prevent resource leak
         let cu_graph_exec = match unsafe { result::graph::instantiate(cu_graph, flags) } {
             Ok(exec) => exec,
-            Err(e) => {
-                let _ = unsafe { result::graph::destroy(cu_graph) };
-                return Err(e);
+            Err(error) => {
+                self.ctx
+                    .record_err(unsafe { result::graph::destroy(cu_graph) });
+                return Err(error);
             }
         };
         Ok(Some(CudaGraph {
@@ -545,7 +546,7 @@ impl CudaGraphDef {
     }
 
     /// Instantiate the graph with raw flags (u64). Use this when the flags value
-    /// is 0 (no flags), since the `CUgraphInstantiate_flags` enum has no 0 variant.
+    /// is 0 (no flags). Typed flags also support `CUgraphInstantiate_flags(0)`.
     pub fn instantiate_raw(&self, flags: u64) -> Result<CudaGraphExec<'_>, DriverError> {
         self.ctx.bind_to_thread()?;
         let cu_graph_exec = unsafe { result::graph::instantiate_raw(self.cu_graph, flags) }?;
@@ -1144,5 +1145,76 @@ impl<'graph> CudaGraphExec<'graph> {
     #[inline]
     pub fn cu_graph_exec(&self) -> sys::CUgraphExec {
         self.cu_graph_exec
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::driver::{sys::CUgraphInstantiate_flags as Flags, CudaContext};
+
+    #[test]
+    fn test_end_capture_flags() {
+        let ctx = CudaContext::new(0).unwrap();
+        // All accesses use one stream; avoid waits on events recorded outside capture.
+        unsafe { ctx.disable_event_tracking() };
+        let stream = ctx.new_stream().unwrap();
+        let flags = [
+            Flags(0),
+            Flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH,
+            #[cfg(not(any(
+                feature = "cuda-11040",
+                feature = "cuda-11050",
+                feature = "cuda-11060"
+            )))]
+            {
+                Flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH
+                    | Flags::CUDA_GRAPH_INSTANTIATE_FLAG_USE_NODE_PRIORITY
+            },
+        ];
+        for flags in flags {
+            let mut data = stream.clone_htod(&[1u32; 4]).unwrap();
+            stream.synchronize().unwrap();
+            stream
+                .begin_capture(sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)
+                .unwrap();
+            stream.memset_zeros(&mut data).unwrap();
+            let graph = stream.end_capture(flags).unwrap().unwrap();
+
+            graph.launch().unwrap();
+            assert_eq!(stream.clone_dtoh(&data).unwrap(), [0; 4]);
+            stream.memcpy_htod(&[2u32; 4], &mut data).unwrap();
+            graph.launch().unwrap();
+            assert_eq!(stream.clone_dtoh(&data).unwrap(), [0; 4]);
+        }
+    }
+
+    #[test]
+    #[cfg(not(any(
+        feature = "cuda-11040",
+        feature = "cuda-11050",
+        feature = "cuda-11060",
+        feature = "cuda-11070",
+        feature = "cuda-11080"
+    )))]
+    fn test_end_capture_invalid_flags() {
+        let ctx = CudaContext::new(0).unwrap();
+        let stream = ctx.new_stream().unwrap();
+        stream
+            .begin_capture(sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)
+            .unwrap();
+        let flags = Flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH
+            | Flags::CUDA_GRAPH_INSTANTIATE_FLAG_DEVICE_LAUNCH;
+        assert!(matches!(
+            stream.end_capture(flags),
+            Err(DriverError(sys::CUresult::CUDA_ERROR_INVALID_VALUE))
+        ));
+
+        stream
+            .begin_capture(sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)
+            .unwrap();
+        let graph = stream.end_capture(Flags(0)).unwrap().unwrap();
+        graph.launch().unwrap();
+        stream.synchronize().unwrap();
     }
 }
