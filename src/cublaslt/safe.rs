@@ -306,6 +306,64 @@ impl MatmulPref {
         }
         Ok(())
     }
+
+    /// Restricts the heuristic to algorithms whose split-K reduction scheme is in `mask`
+    /// (a `cublasLtReductionScheme_t` bit set; `CUBLASLT_REDUCTION_SCHEME_NONE`, no split, is
+    /// always allowed).
+    fn set_reduction_scheme_mask(&self, mask: u32) -> Result<(), CublasError> {
+        unsafe {
+            result::set_matmul_pref_attribute(
+                self.handle,
+                sys::cublasLtMatmulPreferenceAttributes_t::CUBLASLT_MATMUL_PREF_REDUCTION_SCHEME_MASK,
+                (&mask) as *const _ as *const _,
+                mem::size_of::<u32>(),
+            )?;
+        }
+        Ok(())
+    }
+
+    /// The preference for a matmul storing `matrix_type` with `workspace_size` bytes of workspace.
+    ///
+    /// A half-precision output (F16 / BF16) may only use the compute-type split-K reduction:
+    /// `CUBLASLT_REDUCTION_SCHEME_INPLACE` reduces in the output buffer and output data type, and
+    /// `CUBLASLT_REDUCTION_SCHEME_OUTPUT_TYPE` stores the partials in the output type (cublasLt.h,
+    /// `cublasLtReductionScheme_t`). Either one rounds every split-K partial to half precision before
+    /// the final sum, so the result is no longer an F32-accumulated dot product rounded once. F32
+    /// outputs are unrestricted: their output type is the compute type.
+    fn for_matmul(
+        matrix_type: sys::cudaDataType,
+        workspace_size: usize,
+    ) -> Result<Self, CublasError> {
+        let pref = Self::new()?;
+        pref.set_workspace_size(workspace_size)?;
+        if matches!(
+            matrix_type,
+            sys::cudaDataType_t::CUDA_R_16F | sys::cudaDataType_t::CUDA_R_16BF
+        ) {
+            pref.set_reduction_scheme_mask(
+                sys::cublasLtReductionScheme_t::CUBLASLT_REDUCTION_SCHEME_COMPUTE_TYPE as u32,
+            )?;
+        }
+        Ok(pref)
+    }
+
+    #[cfg(test)]
+    fn reduction_scheme_mask(&self) -> Result<u32, CublasError> {
+        let mut mask = 0u32;
+        let mut written = 0usize;
+        unsafe {
+            sys::cublasLtMatmulPreferenceGetAttribute(
+                self.handle,
+                sys::cublasLtMatmulPreferenceAttributes_t::CUBLASLT_MATMUL_PREF_REDUCTION_SCHEME_MASK,
+                (&mut mask) as *mut _ as *mut _,
+                mem::size_of::<u32>(),
+                &mut written,
+            )
+            .result()?;
+        }
+        assert_eq!(written, mem::size_of::<u32>());
+        Ok(mask)
+    }
 }
 
 impl Drop for MatmulPref {
@@ -465,11 +523,9 @@ pub trait Matmul<T>: MatmulShared {
         let (bias, _record_bias) = bias.map(|b| b.device_ptr(stream)).unzip();
         matmul_desc.set_epilogue(act, bias.as_ref(), cfg.stride_bias)?;
 
-        // Create matmul heuristic search preferences
-        let matmul_pref = MatmulPref::new()?;
-
-        // Set workspace size
-        matmul_pref.set_workspace_size(self.workspace().size)?;
+        // Heuristic search preferences: workspace size, and for half outputs only the
+        // compute-type split-K reduction (see `MatmulPref::for_matmul`).
+        let matmul_pref = MatmulPref::for_matmul(Self::matrix_type(), self.workspace().size)?;
 
         // Get heuristic given Config, bias, act and workspace size
         let heuristic = result::get_matmul_algo_heuristic(
@@ -560,6 +616,82 @@ impl Matmul<half::bf16> for CudaBlasLT {
 #[cfg(test)]
 mod tests {
     #![allow(clippy::needless_range_loop)]
+
+    /// Half outputs restrict split-K to the compute-type reduction; F32 keeps cuBLASLt's default
+    /// mask (every scheme). Read back from the preference cuBLASLt's heuristic receives.
+    #[test]
+    fn half_output_preference_allows_only_compute_type_reduction() -> Result<(), CublasError> {
+        let compute = sys::cublasLtReductionScheme_t::CUBLASLT_REDUCTION_SCHEME_COMPUTE_TYPE as u32;
+        let all = sys::cublasLtReductionScheme_t::CUBLASLT_REDUCTION_SCHEME_MASK as u32;
+        for half in [
+            sys::cudaDataType_t::CUDA_R_16F,
+            sys::cudaDataType_t::CUDA_R_16BF,
+        ] {
+            let pref = MatmulPref::for_matmul(half, 1 << 22)?;
+            assert_eq!(pref.reduction_scheme_mask()?, compute, "{half:?}");
+        }
+        let pref = MatmulPref::for_matmul(sys::cudaDataType_t::CUDA_R_32F, 1 << 22)?;
+        assert_eq!(
+            pref.reduction_scheme_mask()?,
+            all,
+            "F32 keeps the default mask"
+        );
+        Ok(())
+    }
+
+    /// With the half-output mask, cuBLASLt's heuristic still returns an algorithm for every shape
+    /// of a spread covering decode to large prefill (an empty result would make the matmul a hard
+    /// `CUBLAS_STATUS_NOT_SUPPORTED` error at serve time). The layout is a linear layer's
+    /// `y[m, n] = x[m, k] · w[n, k]ᵀ` as cuBLASLt sees it in column-major: `D[n, m] = Aᵀ·B` with
+    /// `A` the `[k, n]` weight (transposed) and `B` the `[k, m]` activations.
+    #[test]
+    fn half_output_mask_leaves_an_algorithm_for_every_shape() {
+        let ctx = CudaContext::new(0).unwrap();
+        let blas = CudaBlasLT::new(ctx.default_stream()).unwrap();
+        let mut missing = Vec::new();
+        let mut checked = 0;
+        for ty in [
+            sys::cudaDataType_t::CUDA_R_16F,
+            sys::cudaDataType_t::CUDA_R_16BF,
+        ] {
+            for m in (0..=12).map(|p| 1u64 << p) {
+                for k in [512u64, 2560, 4096, 8192] {
+                    for n in [512u64, 2560, 4096, 8192] {
+                        let a = MatrixLayout::new(ty, k, n, k as i64).unwrap();
+                        let b = MatrixLayout::new(ty, k, m, k as i64).unwrap();
+                        let c = MatrixLayout::new(ty, n, m, n as i64).unwrap();
+                        let desc = MatmulDesc::new(
+                            sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+                            sys::cudaDataType_t::CUDA_R_32F,
+                        )
+                        .unwrap();
+                        desc.set_transpose(true, Matrix::A).unwrap();
+                        let pref = MatmulPref::for_matmul(ty, blas.workspace().size).unwrap();
+                        let found = unsafe {
+                            result::get_matmul_algo_heuristic(
+                                *blas.handle(),
+                                desc.handle,
+                                a.handle,
+                                b.handle,
+                                c.handle,
+                                c.handle,
+                                pref.handle,
+                            )
+                        };
+                        checked += 1;
+                        if found.is_err() {
+                            missing.push(format!("{ty:?} m={m} k={k} n={n}"));
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(checked, 2 * 13 * 4 * 4);
+        assert!(
+            missing.is_empty(),
+            "no algorithm under the mask: {missing:?}"
+        );
+    }
 
     use crate::driver::CudaContext;
 
